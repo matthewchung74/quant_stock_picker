@@ -2,210 +2,233 @@
 """
 Position Analysis Module
 
-This module provides functions for analyzing existing stock positions and generating
-recommendations based on comprehensive analysis.
+This module provides specialized analysis for existing stock positions using AI.
 """
 
-import asyncio
-import json
-import re
+import os
 import time
 import traceback
 from datetime import datetime
-from typing import Dict, Any, Optional
+from enum import Enum
+from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIModel
 
 from logging_utils import get_component_logger
-from main import RecommendationType, SellRecommendation, StrategyAgentDependencies, strategy_agent
-from strategy_analyzer import get_strategy_with_agent
-from sentiment_analyzer import get_sentiment_analysis_with_agent
-from macro_analyzer import get_macro_analysis_with_agent
-from market_data_fetcher import get_market_data_with_agent
+from market_data_fetcher import MarketData
+from sentiment_analyzer import SentimentAnalysisResult
+from macro_analyzer import MacroAnalysisResult
 
-def analyze_existing_position(ticker: str, purchase_price: float, purchase_date: str) -> SellRecommendation:
+# Load environment variables
+load_dotenv()
+
+class PositionAction(str, Enum):
+    """Types of position actions"""
+    HOLD = "HOLD"
+    EXIT = "EXIT"
+    ADD = "ADD"
+    ERROR = "ERROR"
+
+class ExistingPosition(BaseModel):
+    """Details of an existing stock position"""
+    ticker: str
+    purchase_price: float
+    purchase_date: datetime
+    quantity: int
+    current_price: float
+    unrealized_pl: float
+    pl_percentage: float
+
+class PositionAnalysis(BaseModel):
+    """Analysis results for an existing position"""
+    ticker: str
+    current_price: float
+    purchase_price: float
+    purchase_date: datetime
+    days_held: int
+    recommendation: PositionAction
+    stop_loss: float
+    target_price: float
+    summary: str
+    explanation: str
+    analysis_time_seconds: float = 0
+
+@dataclass
+class PositionAnalyzerDependencies:
+    """Dependencies for the Position Analysis Agent"""
+    position: ExistingPosition
+    market_data: MarketData
+    sentiment_analysis: SentimentAnalysisResult
+    macro_analysis: MacroAnalysisResult
+
+# Initialize AI model
+ai_model = OpenAIModel(
+    model_name=os.environ.get("PREFERRED_AI_MODEL", "deepseek-chat"),
+    base_url=os.environ.get("PREFERRED_AI_URL", "https://api.deepseek.com/v1"),
+    api_key=os.environ.get("DEEPSEEK_API_KEY")
+)
+
+# Create the Position Analysis Agent
+position_agent = Agent(
+    model=ai_model,
+    deps_type=PositionAnalyzerDependencies,
+    result_type=PositionAnalysis,
+    system_prompt=(
+        "You are a position management specialist focusing on analyzing existing stock positions. "
+        "Your task is to evaluate current positions and provide specific recommendations for managing them. "
+        "Provide clear, actionable recommendations with specific price targets and rationale.\n\n"
+        "Your analysis must include:\n"
+        "1. Clear HOLD, EXIT, or ADD recommendation\n"
+        "2. Stop loss price\n"
+        "3. Target price\n"
+        "4. Brief summary\n"
+        "5. Detailed explanation of the recommendation"
+    )
+)
+
+def get_position_analysis(
+    position: ExistingPosition,
+    market_data: MarketData,
+    sentiment_analysis: SentimentAnalysisResult,
+    macro_analysis: MacroAnalysisResult
+) -> PositionAnalysis:
     """
-    Analyze an existing stock position and provide a recommendation.
+    Analyze an existing position and provide management recommendations.
     
     Args:
-        ticker: Stock ticker symbol
-        purchase_price: Original purchase price
-        purchase_date: Date of purchase (YYYY-MM-DD)
+        position: Details of the existing position
+        market_data: Current market data
+        sentiment_analysis: Current sentiment analysis
+        macro_analysis: Current macro analysis
         
     Returns:
-        SellRecommendation object with analysis results
+        PositionAnalysis with recommendations
     """
     logger = get_component_logger("PositionAnalysis")
-    logger.info(f"Analyzing existing position for {ticker}, purchased at ${purchase_price} on {purchase_date}")
+    logger.info(f"Analyzing position for {position.ticker}")
     
     start_time = time.time()
+    days_held = (datetime.now() - position.purchase_date).days
     
     try:
-        # Get market data
-        market_data = get_market_data_with_agent(ticker)
-        logger.info(f"Current price for {ticker}: ${market_data.latest_price:.2f}" if market_data.latest_price else "Price data not available")
+        # Set up dependencies
+        deps = PositionAnalyzerDependencies(
+            position=position,
+            market_data=market_data,
+            sentiment_analysis=sentiment_analysis,
+            macro_analysis=macro_analysis
+        )
         
-        # Get sentiment analysis
-        sentiment_analysis = get_sentiment_analysis_with_agent(ticker)
-        logger.info(f"Completed sentiment analysis for {ticker}")
+        # Build the analysis prompt
+        current_date = datetime.now()
+        prompt = f"""
+        Analyze the existing position in {position.ticker} stock:
         
-        # Get macro analysis
-        macro_analysis = get_macro_analysis_with_agent(ticker)
-        logger.info(f"Completed macro analysis for {ticker}")
+        CURRENT DATE: {current_date.strftime('%Y-%m-%d')}
         
-        # Get trading strategy
-        strategy = get_strategy_with_agent(ticker, market_data.latest_price, market_data, sentiment_analysis, macro_analysis)
-        logger.info(f"Completed trading strategy for {ticker}")
+        POSITION DETAILS:
+        - Purchase Price: ${position.purchase_price:.2f}
+        - Purchase Date: {position.purchase_date.strftime('%Y-%m-%d')}
+        - Days Held: {days_held}
+        - Current Price: ${position.current_price:.2f}
+        - Unrealized P/L: ${position.unrealized_pl:.2f} ({position.pl_percentage:.1f}%)
+        - Position Size: {position.quantity:,} shares
         
-        # Create analysis dictionary to match the structure expected by the rest of the function
-        analysis = {
-            'market_data': market_data,
-            'sentiment_analysis': sentiment_analysis,
-            'macro_analysis': macro_analysis,
-            'strategy': strategy
-        }
+        MARKET DATA:
+        - Price Changes: {market_data.price_changes}
+        - Technical Indicators: {market_data.latest_indicators}
         
-        # Extract current price from the analysis
-        current_price = 0
-        if market_data and market_data.latest_price:
-            current_price = market_data.latest_price
+        SENTIMENT: {sentiment_analysis.sentiment_rating} ({sentiment_analysis.confidence_level})
+        {sentiment_analysis.explanation}
         
-        if current_price <= 0:
-            logger.warning(f"Could not get current price for {ticker}, using placeholder value")
-            current_price = purchase_price  # Use purchase price as fallback
+        MACRO ANALYSIS:
+        {macro_analysis.summary}
         
-        # Calculate days held
-        purchase_datetime = datetime.fromisoformat(purchase_date)
-        days_held = (datetime.now() - purchase_datetime).days
+        Provide:
+        1. Clear recommendation (HOLD/EXIT/ADD)
+        2. Stop loss price
+        3. Target price
+        4. Brief summary (1-2 sentences)
+        5. Detailed explanation
+        """
         
-        # Calculate profit/loss
-        p_l_dollar = current_price - purchase_price
-        p_l_percent = (p_l_dollar / purchase_price) * 100
+        # Get analysis from the agent
+        result = position_agent.run_sync(
+            prompt,
+            deps=deps,
+            model_settings={"temperature": 0.2}
+        )
         
-        # Default to ANALYSIS_ONLY recommendation
-        action = RecommendationType.ANALYSIS_ONLY
-        limit_price = None
-        stop_loss_price = None
-        target_price = None
-        entry_price = None
-        rationale = f"Analysis only recommendation for {ticker}."
+        # Add analysis time
+        analysis = result.data
+        analysis.analysis_time_seconds = time.time() - start_time
         
-        # If we have a strategy, extract any price targets
-        if strategy:
-            # Extract structured parameters from the strategy
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                # Create dependency context for the strategy agent
-                deps = StrategyAgentDependencies(
-                    ticker=ticker,
-                    current_price=current_price
-                )
-                
-                # Create a prompt to extract parameters from the strategy text
-                prompt = f"""
-                Below is a trading strategy for {ticker}. Please extract the entry prices, stop-loss prices, profit targets, and risk/reward ratios for each timeframe (Day, Swing, and Long-Term).
-                
-                For each timeframe, I need:
-                1. Entry price
-                2. Stop-loss price
-                3. Profit target price
-                4. Risk/reward ratio
-                
-                If any information is not available, indicate it as missing.
-                
-                Return the information as JSON with this structure:
-                {{
-                    "ticker": "{ticker}",
-                    "strategies": [
-                        {{
-                            "timeframe": "DAY",
-                            "entry_price": 123.45,
-                            "stop_loss_price": 120.00,
-                            "profit_target": 130.00,
-                            "risk_reward": "1:2"
-                        }},
-                        ... (other timeframes)
-                    ]
-                }}
-                
-                STRATEGY TEXT:
-                {strategy}
-                """
-                
-                # Call the strategy agent directly
-                result = loop.run_until_complete(
-                    strategy_agent.run(prompt, deps=deps)
-                )
-                loop.close()
-                
-                # Parse the result
-                try:
-                    # Try to extract structured JSON from the result
-                    json_match = re.search(r'\{[\s\S]*\}', result)
-                    if json_match:
-                        json_str = json_match.group(0)
-                        params_dict = json.loads(json_str)
-                        
-                        # Extract price targets from the first strategy (day trading)
-                        if "strategies" in params_dict and params_dict["strategies"]:
-                            for strat in params_dict["strategies"]:
-                                if strat.get("timeframe") == "DAY":
-                                    entry_price = strat.get("entry_price")
-                                    stop_loss_price = strat.get("stop_loss_price")
-                                    target_price = strat.get("profit_target")
-                                    break
-                            
-                            # If we found price targets, update the recommendation
-                            if target_price and current_price < target_price:
-                                action = RecommendationType.HOLD_WITH_STOP_LOSS
-                                rationale = f"Hold {ticker} with a stop loss at ${stop_loss_price:.2f} and target price of ${target_price:.2f}."
-                            elif stop_loss_price and current_price < stop_loss_price:
-                                action = RecommendationType.SELL_NOW
-                                rationale = f"Sell {ticker} now as price is below stop loss of ${stop_loss_price:.2f}."
-                            
-                            logger.info(f"Successfully extracted structured strategy parameters for {ticker}")
-                except Exception as e:
-                    logger.error(f"Error extracting strategy parameters: {e}")
-                    # Continue without parameters
-            except Exception as e:
-                logger.error(f"Error extracting parameters: {e}")
-                # Continue without parameters
+        logger.info(f"Position analysis completed in {analysis.analysis_time_seconds:.2f} seconds")
+        logger.info(f"Recommendation: {analysis.recommendation}")
         
-        # Create the recommendation
-        recommendation = SellRecommendation(
-            ticker=ticker,
-            current_price=current_price,
-            purchase_price=purchase_price,
-            purchase_date=purchase_date,
-            days_held=days_held,
-            p_l_percent=p_l_percent,
-            p_l_dollar=p_l_dollar,
-            action=action,
-            limit_price=limit_price,
-            stop_loss_price=stop_loss_price,
-            target_price=target_price,
-            entry_price=entry_price,
-            rationale=rationale,
-            recommendation_time_seconds=time.time() - start_time,
+        return analysis
+        
+    except Exception as e:
+        logger.error(f"Error analyzing position: {e}")
+        logger.error(traceback.format_exc())
+        raise
+
+if __name__ == "__main__":
+    """Example usage of position analysis"""
+    # Example position
+    position = ExistingPosition(
+        ticker="AAPL",
+        purchase_price=150.00,
+        purchase_date=datetime(2023, 1, 1),
+        quantity=100,
+        current_price=175.00,
+        unrealized_pl=2500.00,
+        pl_percentage=16.67
+    )
+    
+    try:
+        # Mock data for example
+        market_data = MarketData(
+            ticker="AAPL",
+            latest_price=175.00,
+            price_changes={"1d": 1.2, "1w": 2.5, "1m": 5.0},
+            latest_indicators={"daily": {"rsi": 55, "sma_50": 170, "sma_200": 160}}
+        )
+        
+        sentiment_analysis = SentimentAnalysisResult(
+            ticker="AAPL",
+            sentiment_rating="BULLISH",
+            confidence_level="HIGH",
+            explanation="Strong earnings and positive market sentiment"
+        )
+        
+        macro_analysis = MacroAnalysisResult(
+            ticker="AAPL",
+            outlook="FAVORABLE",
+            economic_indicators_impact="Low interest rates and stable inflation supporting tech valuations",
+            geopolitical_factors_impact="Limited exposure to current geopolitical tensions",
+            industry_trends_impact="Strong tech sector growth and AI adoption driving demand",
+            summary="Favorable macro conditions with strong tech sector performance",
             timestamp=datetime.now().isoformat()
         )
         
-        logger.info(f"Generated recommendation for {ticker}: {action.value}")
-        return recommendation
+        # Get analysis
+        analysis = get_position_analysis(position, market_data, sentiment_analysis, macro_analysis)
+        
+        # Print results
+        print("\n" + "=" * 50)
+        print(f"POSITION ANALYSIS FOR {position.ticker}")
+        print("=" * 50)
+        print(f"Recommendation: {analysis.recommendation}")
+        print(f"Stop Loss: ${analysis.stop_loss:.2f}")
+        print(f"Target Price: ${analysis.target_price:.2f}")
+        print(f"\nSummary: {analysis.summary}")
+        print("\nExplanation:")
+        print(analysis.explanation)
         
     except Exception as e:
-        logger.error(f"Error analyzing position for {ticker}: {e}")
-        logger.error(traceback.format_exc())
-        
-        # Return error recommendation
-        return SellRecommendation(
-            ticker=ticker,
-            current_price=0,
-            purchase_price=purchase_price,
-            purchase_date=purchase_date,
-            action=RecommendationType.ERROR,
-            rationale=f"Error generating recommendation: {str(e)}",
-            recommendation_time_seconds=time.time() - start_time
-        ) 
+        print(f"Error: {e}")
+        traceback.print_exc() 

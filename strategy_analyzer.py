@@ -75,10 +75,10 @@ strategy_agent = Agent(
 )
 
 def get_strategy_with_agent(
-    ticker: str,     
-    market_data: Optional[MarketData] = None,
-    sentiment_analysis: Optional[SentimentAnalysisResult] = None,
-    macro_analysis: Optional[MacroAnalysisResult] = None
+    ticker: str,
+    market_data: MarketData,
+    sentiment_analysis: SentimentAnalysisResult,
+    macro_analysis: MacroAnalysisResult
 ) -> TradingStrategy:
     """
     Get a comprehensive trading strategy for a stock using a specialized agent.
@@ -86,9 +86,9 @@ def get_strategy_with_agent(
     Args:
         ticker: Stock ticker symbol
         current_price: Current price of the stock
-        market_data: Market data for the stock (optional)
-        sentiment_analysis: Sentiment analysis result (optional)
-        macro_analysis: Macro analysis result (optional)
+        market_data: Market data for the stock
+        sentiment_analysis: Sentiment analysis result
+        macro_analysis: Macro analysis result
         
     Returns:
         TradingStrategy object containing the structured trading strategy
@@ -107,82 +107,47 @@ def get_strategy_with_agent(
             macro_analysis=macro_analysis
         )
         
-        # Format sentiment analysis for strategy generation if available
-        sentiment_text = ""
-        if sentiment_analysis:
-            sentiment_text = (
-                f"Overall Sentiment: {sentiment_analysis.sentiment_rating}, "
-                f"Confidence: {sentiment_analysis.confidence_level}\n\n"
-                f"{sentiment_analysis.explanation}"
-            )
-            if sentiment_analysis.news_summary:
-                sentiment_text += f"\n\nNews Summary: {sentiment_analysis.news_summary}"
-            if sentiment_analysis.social_media_summary:
-                sentiment_text += f"\n\nSocial Media Summary: {sentiment_analysis.social_media_summary}"
-            if sentiment_analysis.analyst_ratings_summary:
-                sentiment_text += f"\n\nAnalyst Ratings Summary: {sentiment_analysis.analyst_ratings_summary}"
+        # Format sentiment analysis for strategy generation
+        sentiment_text = (
+            f"Overall Sentiment: {sentiment_analysis.sentiment_rating}, "
+            f"Confidence: {sentiment_analysis.confidence_level}\n\n"
+            f"{sentiment_analysis.explanation}"
+        )
+        if sentiment_analysis.news_summary:
+            sentiment_text += f"\n\nNews Summary: {sentiment_analysis.news_summary}"
+        if sentiment_analysis.social_media_summary:
+            sentiment_text += f"\n\nSocial Media Summary: {sentiment_analysis.social_media_summary}"
+        if sentiment_analysis.analyst_ratings_summary:
+            sentiment_text += f"\n\nAnalyst Ratings Summary: {sentiment_analysis.analyst_ratings_summary}"
         
-        # Format macro analysis for strategy generation if available
-        macro_text = ""
-        if macro_analysis:
-            macro_text = f"MACROECONOMIC OUTLOOK: {macro_analysis.outlook}\n\n"
-            macro_text += f"ECONOMIC INDICATORS IMPACT:\n{macro_analysis.economic_indicators_impact}\n\n"
-            macro_text += f"GEOPOLITICAL FACTORS IMPACT:\n{macro_analysis.geopolitical_factors_impact}\n\n"
-            macro_text += f"INDUSTRY TRENDS IMPACT:\n{macro_analysis.industry_trends_impact}\n\n"
-            
-            macro_text += "KEY RISKS:\n"
-            for i, risk in enumerate(macro_analysis.key_risks, 1):
-                macro_text += f"{i}. {risk}\n"
-            
-            macro_text += "\nOPPORTUNITIES:\n"
-            for i, opportunity in enumerate(macro_analysis.opportunities, 1):
-                macro_text += f"{i}. {opportunity}\n"
-            
-            macro_text += f"\nSUMMARY:\n{macro_analysis.summary}"
+        # Format macro analysis for strategy generation
+        macro_text = f"MACROECONOMIC OUTLOOK: {macro_analysis.outlook}\n\n"
+        macro_text += f"ECONOMIC INDICATORS IMPACT:\n{macro_analysis.economic_indicators_impact}\n\n"
+        macro_text += f"GEOPOLITICAL FACTORS IMPACT:\n{macro_analysis.geopolitical_factors_impact}\n\n"
+        macro_text += f"INDUSTRY TRENDS IMPACT:\n{macro_analysis.industry_trends_impact}\n\n"
         
         # Prompt for strategy development
         prompt = f"""
-        Develop a comprehensive trading strategy for {ticker} stock, currently trading at ${market_data.latest_price:.2f}.        
-        Todays date is ${datetime.now().strftime('%Y%m%d_%H%M%S')}
-        Focus on Day Trading Strategy (1-3 days) using the information provided. """
+        Develop a comprehensive trading strategy for {ticker} stock, currently trading at ${market_data.latest_price:.2f}.
         
-        # Add market data context if available
-        if market_data:
-            prompt += "\n\nMarket Data Context:"
-            if hasattr(market_data, 'price_changes') and market_data.price_changes:
-                prompt += "\nPrice Changes:"
-                for period, change in market_data.price_changes.items():
-                    prompt += f"\n- {period}: {change:.2f}%"
-            
-            if hasattr(market_data, 'latest_indicators') and market_data.latest_indicators:
-                prompt += "\n\nTechnical Indicators:"
-                for timeframe, indicators in market_data.latest_indicators.items():
-                    prompt += f"\n- {timeframe} timeframe:"
-                    if hasattr(indicators, 'rsi') and indicators.rsi:
-                        prompt += f"\n  - RSI: {indicators.rsi:.1f}"
-                    if hasattr(indicators, 'sma_50') and indicators.sma_50:
-                        prompt += f"\n  - SMA 50: ${indicators.sma_50:.2f}"
-                    if hasattr(indicators, 'sma_200') and indicators.sma_200:
-                        prompt += f"\n  - SMA 200: ${indicators.sma_200:.2f}"
-            
-            if hasattr(market_data, 'support_resistance') and market_data.support_resistance:
-                if hasattr(market_data.support_resistance, 'support') and market_data.support_resistance.support:
-                    prompt += "\n\nSupport Levels:"
-                    for level in market_data.support_resistance.support:
-                        prompt += f"\n- ${level:.2f}"
-                
-                if hasattr(market_data.support_resistance, 'resistance') and market_data.support_resistance.resistance:
-                    prompt += "\n\nResistance Levels:"
-                    for level in market_data.support_resistance.resistance:
-                        prompt += f"\n- ${level:.2f}"
+        MARKET DATA:
+        - Price Changes: {market_data.price_changes}
+        - Technical Indicators: {market_data.latest_indicators}
         
-        # Add sentiment analysis context if available
-        if sentiment_text:
-            prompt += f"\n\nSentiment Analysis Summary:\n{sentiment_text[:300]}..."
+        SENTIMENT ANALYSIS:
+        {sentiment_text}
         
-        # Add macro analysis context if available
-        if macro_text:
-            prompt += f"\n\nMacro Analysis Summary:\n{macro_text[:300]}..."
+        MACRO ANALYSIS:
+        {macro_text}
+        
+        Provide:
+        1. Entry price
+        2. Stop loss price
+        3. Profit target
+        4. Risk/reward ratio
+        5. Brief summary (1-2 sentences)
+        6. Detailed explanation of the strategy
+        """
         
         # Run the agent to get the strategy
         result = strategy_agent.run_sync(

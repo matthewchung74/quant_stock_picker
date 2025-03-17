@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+from pydantic_ai.common_tools.tavily import tavily_search_tool
 
 # Import the logging utilities from the main application
 from logging_utils import get_component_logger
@@ -64,11 +65,12 @@ macro_agent = Agent(
     model=ai_model,
     deps_type=MacroAnalysisDependencies,
     result_type=MacroAnalysisResult,
-    tools=[duckduckgo_search_tool()],    
+    tools=[duckduckgo_search_tool(), tavily_search_tool(os.getenv('TAVILY_API_KEY'))],    
     system_prompt=(
         "You are a macroeconomic analysis expert specializing in how broader economic factors "
         "impact specific stocks and sectors. "
         "You will use DuckDuckGo search to find the most relevant and recent macroeconomic information. "
+        "If the DuckDuckGo search fails or has an error, you will use Tavily search to find more information. "
         "Your task is to provide detailed analysis on how "
         "macroeconomic indicators, interest rates, inflation, geopolitical events, and industry "
         "trends might affect a specific stock. "

@@ -28,6 +28,9 @@ from macro_analyzer import get_macro_analysis_with_agent
 from market_data_fetcher import MarketData, get_market_data_with_agent
 from strategy_analyzer import get_strategy_with_agent, TradingStrategy
 
+# Import the new CSV functions
+from csv_writer import generate_recommendations_csv, generate_position_analysis_csv
+
 # Initialize logging at the start of the application
 logger = setup_logging(log_file=f"quant_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", redirect_stdout=False)
 
@@ -77,79 +80,13 @@ def generate_complete_analysis(ticker: str) -> TradingStrategy:
         elapsed_time = time.time() - start_time
         logger.info(f"Complete analysis for {ticker} completed in {elapsed_time:.2f} seconds")
 
-        return strategy, market_data
+        return strategy, market_data, sentiment_analysis, macro_analysis
         
     except Exception as e:
         logger.error(f"Error generating complete analysis for {ticker}: {e}")
         logger.error(traceback.format_exc())
         raise
 
-
-def generate_recommendations_csv(strategies: Dict[str, TradingStrategy], market_data: Dict[str, MarketData]) -> str:
-    """
-    Generate a CSV file with all recommendations.
-    
-    Args:
-        analyses: Dictionary of analysis results, keyed by ticker
-        
-    Returns:
-        Path to the generated CSV file
-    """
-    logger = get_component_logger("CSVGenerator")
-    logger.info("Generating recommendations CSV")
-    
-    # Create output directory if it doesn't exist
-    output_dir = Path('output')
-    output_dir.mkdir(exist_ok=True)
-    
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    csv_path = output_dir / f"recommendations_{timestamp}.csv"
-    
-    try:
-        with open(csv_path, 'w', newline='') as csvfile:
-            # Define CSV fields based on TradingStrategy model
-            fieldnames = [
-                'Ticker',
-                'Current Price',
-                'Expiration Date',
-                'Entry Price',
-                'Stop Loss Price',
-                'Profit Target',
-                'Risk/Reward',
-                'Summary',
-                'Explanation'
-            ]
-            
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            
-            # Add rows for stocks with analyses
-            for ticker, strategy in strategies.items():
-                # Get current price if available
-                current_price = f"${market_data[ticker].latest_price:.2f}"
-                
-                row = {
-                    'Ticker': ticker,
-                    'Current Price': current_price,
-                    'Expiration Date': strategy.expiration_date or "N/A",
-                    'Entry Price': f"${strategy.entry_price:.2f}" if strategy.entry_price else "N/A",
-                    'Stop Loss Price': f"${strategy.stop_loss_price:.2f}" if strategy.stop_loss_price else "N/A",
-                    'Profit Target': f"${strategy.profit_target:.2f}" if strategy.profit_target else "N/A",
-                    'Risk/Reward': strategy.risk_reward or "N/A",
-                    'Summary': strategy.summary or "N/A",
-                    'Explanation': strategy.explanation or "N/A"
-                }
-
-                writer.writerow(row)
-        
-        logger.info(f"CSV file generated successfully: {csv_path}")
-        return str(csv_path)
-        
-    except Exception as e:
-        logger.error(f"Error generating CSV file: {e}")
-        logger.error(traceback.format_exc())
-        return f"Error generating CSV: {str(e)}"
 
 def run_analysis():
     """Run the stock analysis process"""
@@ -158,6 +95,8 @@ def run_analysis():
     # Dictionary to store all analysis results
     all_analyses = {}
     all_market_data = {}
+    all_sentiment_analysis = {}
+    all_macro_analysis = {}
 
     # Step 1: Screen for top swing trading candidates
     logger.info("\n======== Screening for Top Swing Trading Candidates ========")
@@ -175,9 +114,11 @@ def run_analysis():
         try:
             logger.info(f"\n----- Starting Complete Analysis for {ticker} -----\n")
             start_time = time.time()
-            analysis, market_data = generate_complete_analysis(ticker)
+            analysis, market_data, sentiment_analysis, macro_analysis = generate_complete_analysis(ticker)
             all_analyses[ticker] = analysis
             all_market_data[ticker] = market_data
+            all_sentiment_analysis[ticker] = sentiment_analysis
+            all_macro_analysis[ticker] = macro_analysis
             elapsed_time = time.time() - start_time
             logger.info(f"Analysis for {ticker} completed in {elapsed_time:.2f} seconds")
         except Exception as e:
@@ -189,6 +130,59 @@ def run_analysis():
     logger.info("\n======== Generating Recommendations CSV ========")
     csv_file = generate_recommendations_csv(all_analyses, all_market_data)
     logger.info(f"Recommendations saved to {csv_file}")
+    
+    # Step 4: Analyze positions as if purchased 2 days ago
+    logger.info("\n======== Analyzing Hypothetical Positions ========")
+    from position_analyzer import get_position_analysis, ExistingPosition
+    from datetime import datetime, timedelta
+
+    purchase_date = datetime.now() - timedelta(days=2)
+    position_analyses = {}
+    
+    for ticker in top_tickers:
+        try:
+            market_data = all_market_data[ticker]
+            hypothetical_purchase_price = market_data.latest_price * 0.98
+            
+            position = ExistingPosition(
+                ticker=ticker,
+                purchase_price=hypothetical_purchase_price,
+                purchase_date=purchase_date,
+                quantity=100,
+                current_price=market_data.latest_price,
+                unrealized_pl=(market_data.latest_price - hypothetical_purchase_price) * 100,
+                pl_percentage=((market_data.latest_price - hypothetical_purchase_price) / hypothetical_purchase_price) * 100
+            )
+            
+            position_analysis = get_position_analysis(
+                position=position,
+                market_data=market_data,
+                sentiment_analysis=all_sentiment_analysis[ticker],
+                macro_analysis=all_macro_analysis[ticker]
+            )
+            
+            position_analyses[ticker] = position_analysis
+            
+            # Log the results
+            logger.info(f"\nPosition Analysis for {ticker}:")
+            logger.info(f"Purchase Price: ${position.purchase_price:.2f}")
+            logger.info(f"Current Price: ${position.current_price:.2f}")
+            logger.info(f"Days Held: {position_analysis.days_held}")
+            logger.info(f"P/L: ${position.unrealized_pl:.2f} ({position.pl_percentage:.1f}%)")
+            logger.info(f"Recommendation: {position_analysis.recommendation}")
+            logger.info(f"Stop Loss: ${position_analysis.stop_loss:.2f}")
+            logger.info(f"Target Price: ${position_analysis.target_price:.2f}")
+            logger.info(f"Summary: {position_analysis.summary}")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing position for {ticker}: {e}")
+            logger.error(traceback.format_exc())
+            continue
+    
+    # Generate position analysis CSV
+    logger.info("\n======== Generating Position Analysis CSV ========")
+    position_csv_file = generate_position_analysis_csv(position_analyses)
+    logger.info(f"Position analyses saved to {position_csv_file}")
     
     logger.info("\n======== Analysis Complete ========")
     return all_analyses

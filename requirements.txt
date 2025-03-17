@@ -1,0 +1,10 @@
+pydantic-ai==0.0.36
+python-dotenv==1.0.0
+alpaca-py==0.39.0
+pandas==2.2.3
+requests== 2.32.3
+numpy==2.2.3
+polygon-api-client==1.14.4
+beautifulsoup4==4.12.3
+pydantic-ai-slim[duckduckgo]
+pydantic-ai-slim[tavily]

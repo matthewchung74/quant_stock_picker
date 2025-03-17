@@ -9,7 +9,6 @@ __pycache__/
 
 # Data files
 *.csv
-*.txt
 
 # Distribution / packaging
 dist/
