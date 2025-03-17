@@ -1,0 +1,10 @@
+Flask
+requests
+numpy
+pandas
+dotenv
+beautifulsoup4
+alpaca-trade-api
+alpaca-py
+pydantic_ai
+duckduckgo-search
