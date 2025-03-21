@@ -10,4 +10,4 @@ services:
     volumes:
       - .:/app
     # command: tail -f /dev/null
-    command: /opt/venv/bin/python trader.py
+    command: python lumibot_agent.py
