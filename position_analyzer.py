@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
+from typing import Optional
 
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -25,6 +26,11 @@ from macro_analyzer import MacroAnalysisResult
 # Load environment variables
 load_dotenv()
 
+class PositionType(str, Enum):
+    """Types of positions"""
+    LONG = "LONG"
+    SHORT = "SHORT"
+
 class PositionAction(str, Enum):
     """Types of position actions"""
     HOLD = "HOLD"
@@ -35,16 +41,20 @@ class PositionAction(str, Enum):
 class ExistingPosition(BaseModel):
     """Details of an existing stock position"""
     ticker: str
+    position_type: PositionType
     purchase_price: float
     purchase_date: datetime
     quantity: int
     current_price: float
     unrealized_pl: float
     pl_percentage: float
+    borrow_cost: Optional[float] = None  # For short positions
+    days_to_cover: Optional[float] = None  # For short positions
 
 class PositionAnalysis(BaseModel):
     """Analysis results for an existing position"""
     ticker: str
+    position_type: PositionType
     current_price: float
     purchase_price: float
     purchase_date: datetime
@@ -55,6 +65,8 @@ class PositionAnalysis(BaseModel):
     summary: str
     explanation: str
     analysis_time_seconds: float = 0
+    borrow_cost_impact: Optional[str] = None  # Analysis of borrowing cost impact for shorts
+    short_squeeze_risk: Optional[str] = None  # Risk assessment for short positions
 
 @dataclass
 class PositionAnalyzerDependencies:
@@ -108,7 +120,7 @@ def get_position_analysis(
         PositionAnalysis with recommendations
     """
     logger = get_component_logger("PositionAnalysis")
-    logger.info(f"Analyzing position for {position.ticker}")
+    logger.info(f"Analyzing {position.position_type} position for {position.ticker}")
     
     start_time = time.time()
     days_held = (datetime.now() - position.purchase_date).days
@@ -125,18 +137,31 @@ def get_position_analysis(
         # Build the analysis prompt
         current_date = datetime.now()
         prompt = f"""
-        Analyze the existing position in {position.ticker} stock:
+        Analyze the existing {position.position_type} position in {position.ticker} stock:
         
         CURRENT DATE: {current_date.strftime('%Y-%m-%d')}
         
         POSITION DETAILS:
+        - Position Type: {position.position_type}
         - Purchase Price: ${position.purchase_price:.2f}
         - Purchase Date: {position.purchase_date.strftime('%Y-%m-%d')}
         - Days Held: {days_held}
         - Current Price: ${position.current_price:.2f}
         - Unrealized P/L: ${position.unrealized_pl:.2f} ({position.pl_percentage:.1f}%)
         - Position Size: {position.quantity:,} shares
+        """
         
+        if position.position_type == PositionType.SHORT:
+            prompt += f"""
+        SHORT-SPECIFIC METRICS:
+        - Borrow Cost: {position.borrow_cost:.2f}% (annualized)
+        - Days to Cover: {position.days_to_cover:.1f}
+        - Is Shortable: {market_data.is_shortable}
+        - Borrow Cost Tier: {market_data.borrow_cost_tier}
+        - Shares Available: {market_data.shares_available or 'Unknown'}
+        """
+        
+        prompt += f"""
         MARKET DATA:
         - Price Changes: {market_data.price_changes}
         - Technical Indicators: {market_data.latest_indicators}
@@ -153,6 +178,12 @@ def get_position_analysis(
         3. Target price
         4. Brief summary (1-2 sentences)
         5. Detailed explanation
+        """
+        
+        if position.position_type == PositionType.SHORT:
+            prompt += """
+        6. Analysis of borrowing cost impact
+        7. Short squeeze risk assessment
         """
         
         # Get analysis from the agent
@@ -181,6 +212,7 @@ if __name__ == "__main__":
     # Example position
     position = ExistingPosition(
         ticker="AAPL",
+        position_type=PositionType.LONG,
         purchase_price=150.00,
         purchase_date=datetime(2023, 1, 1),
         quantity=100,

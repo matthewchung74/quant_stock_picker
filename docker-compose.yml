@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  my-python-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4000:80"
+    volumes:
+      - .:/app
+    # command: tail -f /dev/null
+    command: /opt/venv/bin/python trader.py

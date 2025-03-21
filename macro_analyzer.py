@@ -50,6 +50,18 @@ class MacroAnalysisResult(BaseModel):
     industry_trends_impact: str
     key_risks: List[str] = Field(default_factory=list)
     opportunities: List[str] = Field(default_factory=list)
+    short_specific_factors: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Factors specifically relevant for short positions"
+    )
+    sector_rotation_impact: str = Field(
+        "",
+        description="Analysis of sector rotation trends and their impact"
+    )
+    liquidity_analysis: str = Field(
+        "",
+        description="Analysis of market liquidity conditions"
+    )
     summary: str
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
@@ -65,15 +77,23 @@ macro_agent = Agent(
     model=ai_model,
     deps_type=MacroAnalysisDependencies,
     result_type=MacroAnalysisResult,
-    tools=[duckduckgo_search_tool(), tavily_search_tool(os.getenv('TAVILY_API_KEY'))],    
+    tools=[duckduckgo_search_tool(), tavily_search_tool(os.getenv('TAVILY_API_KEY'))],
     system_prompt=(
         "You are a macroeconomic analysis expert specializing in how broader economic factors "
         "impact specific stocks and sectors. "
-        "You will use DuckDuckGo search to find the most relevant and recent macroeconomic information. "
-        "If the DuckDuckGo search fails or has an error, you will use Tavily search to find more information. "
+        "You will use Tavily search to find the most relevant and recent macroeconomic information. "
+        "If the Tavily search fails or has an error, you will use DuckDuckGo search to find more information. "
         "Your task is to provide detailed analysis on how "
         "macroeconomic indicators, interest rates, inflation, geopolitical events, and industry "
-        "trends might affect a specific stock. "
+        "trends might affect a specific stock. Pay special attention to factors that could "
+        "create opportunities for both long and short positions, such as:\n"
+        "- Sector rotation trends\n"
+        "- Market liquidity conditions\n"
+        "- Interest rate impacts\n"
+        "- Currency fluctuations\n"
+        "- Supply chain disruptions\n"
+        "- Regulatory changes\n"
+        "- Competitive pressures\n\n"
         "You must return a structured result with the following fields:\n"
         "- ticker: The stock symbol being analyzed\n"
         "- outlook: One of 'FAVORABLE', 'NEUTRAL', or 'UNFAVORABLE'\n"
@@ -82,6 +102,9 @@ macro_agent = Agent(
         "- industry_trends_impact: Analysis of how industry trends affect the stock\n"
         "- key_risks: List of key macroeconomic risks for this stock\n"
         "- opportunities: List of key macroeconomic opportunities for this stock\n"
+        "- short_specific_factors: Dictionary of factors specifically relevant for short positions\n"
+        "- sector_rotation_impact: Analysis of sector rotation trends\n"
+        "- liquidity_analysis: Analysis of market liquidity conditions\n"
         "- summary: A comprehensive summary of the entire macroeconomic analysis\n"
         "\nEnsure your outlook value exactly matches one of the allowed values."
     )
@@ -149,6 +172,13 @@ if __name__ == "__main__":
         print("\nOPPORTUNITIES:")
         for i, opportunity in enumerate(result.opportunities, 1):
             print(f"{i}. {opportunity}")
+        print("\nSHORT SPECIFIC FACTORS:")
+        for factor, description in result.short_specific_factors.items():
+            print(f"{factor}: {description}")
+        print("\nSECTOR ROTATION IMPACT:")
+        print(result.sector_rotation_impact)
+        print("\nLIQUIDITY ANALYSIS:")
+        print(result.liquidity_analysis)
         print("\nSUMMARY:")
         print(result.summary)
         print("\n" + "-" * 50)

@@ -27,12 +27,15 @@ import numpy as np
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Literal
 from bs4 import BeautifulSoup
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import Adjustment
+import yfinance as yf
+from russel_2k import r2k_tickers
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(
@@ -45,11 +48,65 @@ logger = logging.getLogger('StockScreener')
 load_dotenv()
 
 # Alpaca API credentials
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY_UNITTEST")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET_UNITTEST")
 
 # Initialize Alpaca client
 stock_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+
+class TechnicalIndicators(BaseModel):
+    price: str = Field(..., alias="Price", description="Current price formatted as currency")
+    ma_50: str = Field(..., alias="50-day MA", description="50-day moving average")
+    ma_200: str = Field(..., alias="200-day MA", description="200-day moving average")
+    rsi: str = Field(..., alias="RSI", description="Relative Strength Index")
+    daily_volume: str = Field(..., alias="Daily Volume", description="Daily trading volume in millions")
+    volatility: str = Field(..., alias="Volatility", description="Price volatility as percentage")
+    change_5d: str = Field(..., alias="5-day Change", description="5-day price change percentage")
+    macd: str = Field(..., alias="MACD", description="Moving Average Convergence Divergence")
+    from_52w_high: str = Field(..., alias="From 52w High", description="Distance from 52-week high")
+    total_score: str = Field(..., alias="Total Score", description="Overall technical score")
+
+    class Config:
+        populate_by_name = True  # New V2 style configuration
+
+class ScoredStock(BaseModel):
+    ticker: str = Field(..., description="Stock ticker symbol")
+    position_type: Literal["LONG", "SHORT"] = Field(..., description="Type of trade position")
+    current_price: float = Field(..., description="Current stock price")
+    entry_price: float = Field(..., description="Suggested entry price")
+    stop_loss: float = Field(..., description="Suggested stop loss price")
+    target_price: float = Field(..., description="Suggested target price")
+    risk_reward: str = Field(..., description="Risk/reward ratio")
+    conviction: Literal["High", "Medium", "Low"] = Field(..., description="Trade conviction level")
+    holding_period: str = Field(..., description="Expected holding period")
+    liquidity_volatility_score: int = Field(..., ge=0, le=30, description="Score for liquidity and volatility (0-30)")
+    momentum_trend_score: int = Field(..., ge=0, le=40, description="Score for momentum and trend (0-40)")
+    price_action_score: int = Field(..., ge=0, le=30, description="Score for recent price action (0-30)")
+    total_score: int = Field(..., ge=0, le=100, description="Total technical score (0-100)")
+    technical_indicators: TechnicalIndicators = Field(..., description="Technical analysis indicators")
+    rationale: List[str] = Field(default_factory=list, description="List of reasons for the score")
+    catalysts: List[str] = Field(default_factory=list, description="List of catalysts for the trade")
+
+class ScreenerResults(BaseModel):
+    candidates: List[ScoredStock] = Field(..., description="List of trade candidates")
+    summary: str = Field(..., description="Text summary of screening results")
+
+def get_nasdaq_100_tickers() -> List[str]:
+    url = "https://en.wikipedia.org/wiki/NASDAQ-100"
+    response = requests.get(url)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Locate the table with tickers
+    table = soup.find("table", {"class": "wikitable sortable"})
+    
+    tickers = []
+    for row in table.find_all("tr")[1:]:
+        cols = row.find_all("td")
+        if cols:
+            tickers.append(cols[1].text.strip())  # Second column has the ticker
+    
+    return tickers
+
 
 def get_sp500_tickers() -> List[str]:
     """
@@ -248,7 +305,181 @@ def calculate_technical_indicators(stock_data: Dict[str, pd.DataFrame]) -> Dict[
     logger.info(f"Completed technical analysis for {len(analysis_results)} stocks")
     return analysis_results
 
-def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
+
+def score_stocks_for_shorts(analysis_results: Dict[str, Dict]) -> List[ScoredStock]:
+    """
+    Score stocks for short trades based on bearish technical indicators.
+    Returns a sorted list with the highest scoring short candidates.
+    
+    Args:
+        analysis_results: Dictionary with technical analysis for each stock
+        
+    Returns:
+        List of ScoredStock objects, sorted by total score
+    """
+    logger.info(f"Scoring {len(analysis_results)} stocks for short opportunities...")
+
+    scored_stocks = []
+
+    for ticker, analysis in analysis_results.items():
+        try:
+            technical_indicators = {
+                "Price": f"${analysis['current_price']:.2f}",
+                "50-day MA": f"${analysis['sma_50']:.2f}",
+                "200-day MA": f"${analysis['sma_200']:.2f}",
+                "RSI": f"{analysis['rsi']:.1f}",
+                "Daily Volume": f"${(analysis['volume_price_ratio']):.1f}M",
+                "Volatility": f"{analysis['volatility']*100:.1f}%",
+                "5-day Change": f"{analysis['change_5d']:.1f}%",
+                "MACD": f"{analysis['macd']:.2f}",
+                "From 52w High": f"{analysis['pct_from_high']:.1f}%"
+            }
+            
+            score = {
+                'ticker': ticker,
+                'position_type': "SHORT",  # Add position type
+                'current_price': analysis['current_price'],
+                'entry_price': analysis['current_price'],  # Initial value, will be refined later
+                'stop_loss': analysis['current_price'] * 1.05,  # Initial 5% stop, will be refined later
+                'target_price': analysis['current_price'] * 0.90,  # Initial 10% target, will be refined later
+                'risk_reward': "1:2",  # Initial value, will be refined later
+                'conviction': "Medium",  # Initial value, will be refined later
+                'holding_period': "5-15 days",
+                'liquidity_volatility_score': 0,
+                'momentum_trend_score': 0,
+                'price_action_score': 0,
+                'total_score': 0,
+                'technical_indicators': technical_indicators,
+                'rationale': [],
+                'catalysts': []
+            }
+
+            # 1️⃣ **Liquidity & Volatility (0-30 points)**
+            # Keep the same logic as long positions
+            volume_score = 0
+            if analysis['volume_price_ratio'] > 50:
+                volume_score = 15
+                score['rationale'].append("High trading volume")
+                score['liquidity_volatility_score'] += volume_score
+            elif analysis['volume_price_ratio'] > 20:
+                volume_score = 10
+                score['rationale'].append("Good trading volume")
+                score['liquidity_volatility_score'] += volume_score
+            elif analysis['volume_price_ratio'] > 5:
+                volume_score = 5
+                score['rationale'].append("Adequate trading volume")
+                score['liquidity_volatility_score'] += volume_score
+
+            volatility_score = 0
+            if 0.25 < analysis['volatility'] < 0.6:
+                volatility_score = 15
+                score['rationale'].append("Ideal volatility for swing trading")
+                score['liquidity_volatility_score'] += volatility_score
+            elif 0.15 < analysis['volatility'] < 0.8:
+                volatility_score = 10
+                score['rationale'].append("Good volatility range")
+                score['liquidity_volatility_score'] += volatility_score
+            elif 0.1 < analysis['volatility'] < 1.0:
+                volatility_score = 5
+                score['rationale'].append("Acceptable volatility")
+                score['liquidity_volatility_score'] += volatility_score
+
+            # 2️⃣ **Momentum & Trend Score (0-40 points)**
+            # We now score stocks in **downtrends** instead of uptrends
+
+            # **Moving Averages (0-15 points)**
+            ma_score = 0
+            if not analysis['above_sma_50'] and not analysis['above_sma_200'] and not analysis['golden_cross']:
+                ma_score = 15
+                score['rationale'].append("Strong downtrend (below 50 & 200 SMAs with death cross)")
+                score['momentum_trend_score'] += ma_score
+            elif not analysis['above_sma_50'] and not analysis['above_sma_200']:
+                ma_score = 10
+                score['rationale'].append("Solid downtrend (below 50 & 200 SMAs)")
+                score['momentum_trend_score'] += ma_score
+            elif not analysis['above_sma_50'] or not analysis['above_sma_200']:
+                ma_score = 5
+                score['rationale'].append("Weak uptrend, possible breakdown")
+                score['momentum_trend_score'] += ma_score
+
+            # **RSI (0-10 points)**
+            rsi_score = 0
+            if analysis['rsi'] > 70:
+                rsi_score = 10
+                score['rationale'].append("Overbought RSI (>70) - Possible short candidate")
+                score['momentum_trend_score'] += rsi_score
+            elif 65 < analysis['rsi'] <= 70:
+                rsi_score = 5
+                score['rationale'].append("RSI approaching overbought levels")
+                score['momentum_trend_score'] += rsi_score
+
+            # **MACD (0-15 points)**
+            macd_score = 0
+            if analysis['macd'] < 0 and analysis['macd_hist'] < 0:
+                macd_score = 15
+                score['rationale'].append("MACD negative with bearish momentum")
+                score['momentum_trend_score'] += macd_score
+            elif analysis['macd'] < 0:
+                macd_score = 10
+                score['rationale'].append("Negative MACD (Downtrend)")
+                score['momentum_trend_score'] += macd_score
+            elif analysis['macd_hist'] < 0:
+                macd_score = 5
+                score['rationale'].append("MACD histogram turning bearish")
+                score['momentum_trend_score'] += macd_score
+
+            # 3️⃣ **Recent Price Action Score (0-30 points)**
+            price_change_score = 0
+            if analysis['change_5d'] < 0 and analysis['change_10d'] < 0 and analysis['change_20d'] < 0:
+                price_change_score = 20
+                score['rationale'].append("Bearish across 5, 10, and 20-day periods")
+                score['price_action_score'] += price_change_score
+            elif analysis['change_5d'] < 0 and analysis['change_10d'] < 0:
+                price_change_score = 15
+                score['rationale'].append("Bearish across 5 and 10-day periods")
+                score['price_action_score'] += price_change_score
+            elif analysis['change_5d'] < 0:
+                price_change_score = 10
+                score['rationale'].append("Bearish 5-day price change")
+                score['price_action_score'] += price_change_score
+
+            # **Near 52-Week Lows (0-10 points)**
+            low_score = 0
+            if analysis['pct_from_high'] < -30:
+                low_score = 10
+                score['rationale'].append("Near 52-week low (strong downtrend)")
+                score['price_action_score'] += low_score
+            elif analysis['pct_from_high'] < -20:
+                low_score = 8
+                score['rationale'].append("Approaching 52-week low")
+                score['price_action_score'] += low_score
+            elif analysis['pct_from_high'] < -10:
+                low_score = 5
+                score['rationale'].append("Downtrend forming, not at lows yet")
+                score['price_action_score'] += low_score
+
+            # **Total Score Calculation**
+            score['total_score'] = (
+                score['liquidity_volatility_score'] +
+                score['momentum_trend_score'] +
+                score['price_action_score']
+            )
+            
+            if score['total_score'] >= 30:
+                score['technical_indicators']["Total Score"] = f"{score['total_score']}"
+                # Update conviction based on total score
+                score['conviction'] = "High" if score['total_score'] >= 70 else "Medium" if score['total_score'] >= 50 else "Low"
+                scored_stocks.append(ScoredStock(**score))
+
+        except Exception as e:
+            logger.warning(f"Error scoring {ticker}: {e}")
+
+    scored_stocks.sort(key=lambda x: x.total_score, reverse=True)
+    logger.info(f"Scored {len(scored_stocks)} stocks for short trades")
+    return scored_stocks
+
+
+def score_stocks_for_longs(analysis_results: Dict[str, Dict]) -> List[ScoredStock]:
     """
     Score each stock based on technical indicators and return sorted results.
     
@@ -256,7 +487,7 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
         analysis_results: Dictionary with technical analysis for each stock
         
     Returns:
-        List of dictionaries with stock scores, sorted by total score
+        List of ScoredStock objects, sorted by total score
     """
     logger.info(f"Scoring {len(analysis_results)} stocks...")
     
@@ -264,15 +495,35 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
     
     for ticker, analysis in analysis_results.items():
         try:
+            technical_indicators = {
+                "Price": f"${analysis['current_price']:.2f}",
+                "50-day MA": f"${analysis['sma_50']:.2f}",
+                "200-day MA": f"${analysis['sma_200']:.2f}",
+                "RSI": f"{analysis['rsi']:.1f}",
+                "Daily Volume": f"${(analysis['volume_price_ratio']):.1f}M",
+                "Volatility": f"{analysis['volatility']*100:.1f}%",
+                "5-day Change": f"{analysis['change_5d']:.1f}%",
+                "MACD": f"{analysis['macd']:.2f}",
+                "From 52w High": f"{analysis['pct_from_high']:.1f}%"
+            }
+            
             score = {
                 'ticker': ticker,
+                'position_type': "LONG",  # Add position type
                 'current_price': analysis['current_price'],
+                'entry_price': analysis['current_price'],  # Initial value, will be refined later
+                'stop_loss': analysis['current_price'] * 0.95,  # Initial 5% stop, will be refined later
+                'target_price': analysis['current_price'] * 1.10,  # Initial 10% target, will be refined later
+                'risk_reward': "1:2",  # Initial value, will be refined later
+                'conviction': "Medium",  # Initial value, will be refined later
+                'holding_period': "5-15 days",
                 'liquidity_volatility_score': 0,
                 'momentum_trend_score': 0,
                 'price_action_score': 0,
                 'total_score': 0,
-                'technical_indicators': {},
-                'rationale': []
+                'technical_indicators': technical_indicators,
+                'rationale': [],
+                'catalysts': []
             }
             
             # 1. Liquidity & Volatility Score (0-30 points)
@@ -282,27 +533,31 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
             if analysis['volume_price_ratio'] > 50:  # Over $50M daily volume
                 volume_score = 15
                 score['rationale'].append("High trading volume")
+                score['liquidity_volatility_score'] += volume_score
             elif analysis['volume_price_ratio'] > 20:  # Over $20M daily volume
                 volume_score = 10
                 score['rationale'].append("Good trading volume")
+                score['liquidity_volatility_score'] += volume_score
             elif analysis['volume_price_ratio'] > 5:  # Over $5M daily volume
                 volume_score = 5
                 score['rationale'].append("Adequate trading volume")
-            score['liquidity_volatility_score'] += volume_score
-            
+                score['liquidity_volatility_score'] += volume_score
+
             # Volatility criteria (0-15 points)
             volatility_score = 0
             if 0.25 < analysis['volatility'] < 0.6:  # Ideal volatility range
                 volatility_score = 15
                 score['rationale'].append("Ideal volatility for swing trading")
+                score['liquidity_volatility_score'] += volatility_score
             elif 0.15 < analysis['volatility'] < 0.8:  # Acceptable volatility
                 volatility_score = 10
                 score['rationale'].append("Good volatility range")
+                score['liquidity_volatility_score'] += volatility_score
             elif 0.1 < analysis['volatility'] < 1.0:  # Borderline volatility
                 volatility_score = 5
                 score['rationale'].append("Acceptable volatility")
-            score['liquidity_volatility_score'] += volatility_score
-            
+                score['liquidity_volatility_score'] += volatility_score
+
             # 2. Momentum & Trend Score (0-40 points)
             
             # Moving Average Position (0-15 points)
@@ -310,40 +565,46 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
             if analysis['above_sma_50'] and analysis['above_sma_200'] and analysis['golden_cross']:
                 ma_score = 15
                 score['rationale'].append("Strong uptrend (above 50 & 200 SMAs with golden cross)")
+                score['momentum_trend_score'] += ma_score
             elif analysis['above_sma_50'] and analysis['above_sma_200']:
                 ma_score = 10
                 score['rationale'].append("Solid uptrend (above 50 & 200 SMAs)")
+                score['momentum_trend_score'] += ma_score
             elif analysis['above_sma_50'] or analysis['above_sma_200']:
                 ma_score = 5
                 score['rationale'].append("Mixed trend signals")
-            score['momentum_trend_score'] += ma_score
-            
+                score['momentum_trend_score'] += ma_score
+
             # RSI criteria (0-10 points)
             rsi_score = 0
             if 40 <= analysis['rsi'] <= 70:  # Ideal RSI range
                 rsi_score = 10
                 score['rationale'].append("RSI in ideal range (40-70)")
+                score['momentum_trend_score'] += rsi_score
             elif 30 <= analysis['rsi'] < 40:  # Potentially oversold
                 rsi_score = 5
                 score['rationale'].append("Potentially oversold (RSI 30-40)")
+                score['momentum_trend_score'] += rsi_score
             elif 70 < analysis['rsi'] <= 75:  # Strong momentum but approaching overbought
                 rsi_score = 5
                 score['rationale'].append("Strong momentum but approaching overbought")
-            score['momentum_trend_score'] += rsi_score
-            
+                score['momentum_trend_score'] += rsi_score
+
             # MACD criteria (0-15 points)
             macd_score = 0
             if analysis['macd'] > 0 and analysis['macd_hist'] > 0:
                 macd_score = 15
                 score['rationale'].append("Strong positive MACD with bullish histogram")
+                score['momentum_trend_score'] += macd_score
             elif analysis['macd'] > 0:
                 macd_score = 10
                 score['rationale'].append("Positive MACD")
+                score['momentum_trend_score'] += macd_score
             elif analysis['macd_hist'] > 0:
                 macd_score = 5
                 score['rationale'].append("MACD histogram turning positive")
-            score['momentum_trend_score'] += macd_score
-            
+                score['momentum_trend_score'] += macd_score
+
             # 3. Recent Price Action Score (0-30 points)
             
             # Recent price changes (0-20 points)
@@ -351,30 +612,35 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
             if analysis['change_5d'] > 0 and analysis['change_10d'] > 0 and analysis['change_20d'] > 0:
                 price_change_score = 20
                 score['rationale'].append("Bullish across 5, 10, and 20-day periods")
+                score['price_action_score'] += price_change_score
             elif analysis['change_5d'] > 0 and analysis['change_10d'] > 0:
                 price_change_score = 15
                 score['rationale'].append("Bullish across 5 and 10-day periods")
+                score['price_action_score'] += price_change_score
             elif analysis['change_5d'] > 0:
                 price_change_score = 10
                 score['rationale'].append("Bullish 5-day price change")
+                score['price_action_score'] += price_change_score
             elif analysis['change_20d'] > 0:
                 price_change_score = 5
                 score['rationale'].append("Bullish 20-day trend despite recent weakness")
-            score['price_action_score'] += price_change_score
-            
+                score['price_action_score'] += price_change_score
+
             # Distance from 52-week high (0-10 points)
             high_score = 0
             if analysis['pct_from_high'] > -5:  # Within 5% of 52-week high
                 high_score = 10
                 score['rationale'].append("Near 52-week high (strong momentum)")
+                score['price_action_score'] += high_score
             elif analysis['pct_from_high'] > -10:  # Within 10% of 52-week high
                 high_score = 8
                 score['rationale'].append("Approaching 52-week high")
+                score['price_action_score'] += high_score
             elif analysis['pct_from_high'] > -20:  # Within 20% of 52-week high
                 high_score = 5
                 score['rationale'].append("Within striking distance of 52-week high")
-            score['price_action_score'] += high_score
-            
+                score['price_action_score'] += high_score
+
             # Calculate total score
             score['total_score'] = (
                 score['liquidity_volatility_score'] + 
@@ -382,123 +648,77 @@ def score_stocks(analysis_results: Dict[str, Dict]) -> List[Dict]:
                 score['price_action_score']
             )
             
-            # Add key technical indicators as strings
-            score['technical_indicators'] = {
-                "Price": f"${analysis['current_price']:.2f}",
-                "50-day MA": f"${analysis['sma_50']:.2f}",
-                "200-day MA": f"${analysis['sma_200']:.2f}",
-                "RSI": f"{analysis['rsi']:.1f}",
-                "Daily Volume": f"${(analysis['volume_price_ratio']):.1f}M",
-                "Volatility": f"{analysis['volatility']*100:.1f}%",
-                "5-day Change": f"{analysis['change_5d']:.1f}%",
-                "MACD": f"{analysis['macd']:.2f}",
-                "From 52w High": f"{analysis['pct_from_high']:.1f}%",
-                "Total Score": f"{score['total_score']}"
-            }
-            
             # Only include stocks with minimum criteria
             if score['total_score'] >= 30 and analysis['volume_price_ratio'] > 1.0:
-                scored_stocks.append(score)
+                score['technical_indicators']["Total Score"] = f"{score['total_score']}"
+                # Update conviction based on total score
+                score['conviction'] = "High" if score['total_score'] >= 70 else "Medium" if score['total_score'] >= 50 else "Low"
+                scored_stocks.append(ScoredStock(**score))
                 
         except Exception as e:
             logger.warning(f"Error scoring {ticker}: {e}")
     
-    # Sort by total score (descending)
-    scored_stocks.sort(key=lambda x: x['total_score'], reverse=True)
-    
+    scored_stocks.sort(key=lambda x: x.total_score, reverse=True)
     logger.info(f"Scored {len(scored_stocks)} stocks")
     return scored_stocks
 
-def format_results(scored_stocks: List[Dict], top_n: int = 3) -> Tuple[List[Dict], str]:
+def format_results(scored_stocks: List[ScoredStock], top_n: int = 3) -> Tuple[List[ScoredStock], str]:
     """
-    Format the top N stocks for display and return both structured data and a summary.
+    Format the top N stocks and return structured data and summary.
     
     Args:
-        scored_stocks: List of scored stock dictionaries
+        scored_stocks: List of scored stock objects
         top_n: Number of top stocks to include
         
     Returns:
         Tuple containing:
-        - List of top stock candidates with formatted data
+        - List of ScoredStock objects
         - Summary text describing the screening results
     """
     top_stocks = scored_stocks[:top_n]
     
     formatted_stocks = []
-    summary = f"Top {len(top_stocks)} Swing Trading Candidates\n\n"
+    summary = f"Top {len(top_stocks)} Trading Candidates\n\n"
     
     for i, stock in enumerate(top_stocks, 1):
-        # Get current price and technical indicators
-        current_price = stock['current_price']
+        formatted_stocks.append(stock)
         
-        # Calculate entry, stop loss and target prices based on technical indicators
-        # Use volatility to determine appropriate stop loss distance
-        volatility = float(stock['technical_indicators']['Volatility'].strip('%')) / 100
-        
-        # Calculate an ATR-like measure for proper stop loss placement (more volatile stocks get wider stops)
-        stop_distance_pct = min(max(volatility * 2, 0.03), 0.08)  # Between 3% and 8% based on volatility
-        
-        # Calculate prices based on volatility and technical strength
-        entry_price = round(current_price * (1 - stop_distance_pct * 0.4), 2)  # Entry closer to current price
-        stop_loss = round(current_price * (1 - stop_distance_pct), 2)
-        
-        # Target based on risk/reward of at least 2:1
-        risk = current_price - stop_loss
-        target_price = round(current_price + (risk * 2), 2)
-        
-        # Calculate risk/reward ratio
-        risk_reward = f"1:{(target_price - entry_price) / (entry_price - stop_loss):.1f}"
-        
-        # Create a formatted stock candidate
-        candidate = {
-            "ticker": stock['ticker'],
-            "current_price": current_price,
-            "entry_price": entry_price,
-            "stop_loss": stop_loss,
-            "target_price": target_price,
-            "risk_reward": risk_reward,
-            "conviction": "High" if stock['total_score'] >= 70 else "Medium" if stock['total_score'] >= 50 else "Low",
-            "holding_period": "5-15 days",  # Based on typical swing trade duration
-            "technical_indicators": stock['technical_indicators'],
-            "catalysts": [f"Technical strength (Score: {stock['total_score']}/100)"],
-            "rationale": ", ".join(stock['rationale'][:3])  # First 3 rationales
-        }
-        
-        formatted_stocks.append(candidate)
-        
-        # Build text summary
-        summary += f"#{i}: {stock['ticker']} (Score: {stock['total_score']}/100)\n"
-        summary += f"Price: ${current_price:.2f} | "
-        summary += f"Entry: ${candidate['entry_price']:.2f} | "
-        summary += f"Stop: ${candidate['stop_loss']:.2f} | "
-        summary += f"Target: ${candidate['target_price']:.2f}\n"
-        summary += f"Key indicators: RSI: {stock['technical_indicators']['RSI']}, "
-        summary += f"Volume: {stock['technical_indicators']['Daily Volume']}, "
-        summary += f"5d Change: {stock['technical_indicators']['5-day Change']}\n"
-        summary += f"Rationale: {candidate['rationale']}\n\n"
+        # Build text summary for stocks
+        tech_ind = stock.technical_indicators.model_dump(by_alias=True)
+        summary += f"#{i}: {stock.ticker} (Score: {stock.total_score}/100)\n"
+        summary += f"Price: {tech_ind['Price']} | "
+        summary += f"Entry: ${stock.entry_price:.2f} | "
+        summary += f"Stop: ${stock.stop_loss:.2f} | "
+        summary += f"Target: ${stock.target_price:.2f}\n"
+        summary += f"Key indicators: RSI: {tech_ind['RSI']}, "
+        summary += f"Volume: {tech_ind['Daily Volume']}, "
+        summary += f"5d Change: {tech_ind['5-day Change']}\n"
+        summary += f"Rationale: {', '.join(stock.rationale[:3])}\n\n"
     
     logger.info(f"Formatted results for top {len(formatted_stocks)} stocks")
     return formatted_stocks, summary
 
-def screen_for_swing_trades(max_stocks: int = 3) -> Tuple[List[Dict], str]:
+def screen_for_swing_trades(max_stocks: int = 3, is_backtest: bool = False) -> ScreenerResults:
     """
-    Main function to screen for swing trading candidates.
+    Main function to screen for both long and short swing trading candidates.
     
     Args:
-        max_stocks: Maximum number of top stocks to return
+        max_stocks: Maximum number of top stocks to return for each position type
         
     Returns:
-        Tuple containing:
-        - List of top stock candidates with all data
-        - Summary text describing the screening results
+        ScreenerResults object containing trade candidates and summary
         
     Raises:
-        RuntimeError: If unable to retrieve S&P 500 tickers or process stock data
+        RuntimeError: If unable to retrieve tickers or process stock data
     """
-    logger.info(f"Starting swing trade screening process for top {max_stocks} candidates")
+    logger.info(f"Starting swing trade screening process for top {max_stocks} long and short candidates")
     
-    # Get S&P 500 tickers
-    tickers = get_sp500_tickers()  # May raise RuntimeError
+    # Get Russell 2000 tickers
+    # tickers = get_nasdaq_100_tickers() + get_sp500_tickers() + r2k_tickers
+    if is_backtest:
+        tickers = get_nasdaq_100_tickers()[:20]
+    else:
+        tickers = r2k_tickers + get_nasdaq_100_tickers()
     logger.info(f"Retrieved {len(tickers)} tickers to analyze")
     
     if not tickers:
@@ -516,27 +736,37 @@ def screen_for_swing_trades(max_stocks: int = 3) -> Tuple[List[Dict], str]:
     if not analysis_results:
         raise RuntimeError("No technical analysis results generated")
     
-    # Score stocks based on technical criteria
-    scored_stocks = score_stocks(analysis_results)
-    
-    if not scored_stocks:
+    # Score stocks based on technical criteria for both long and short positions
+    scored_stocks_longs = score_stocks_for_longs(analysis_results)
+    scored_stocks_shorts = score_stocks_for_shorts(analysis_results)
+
+    # Combine the scored stocks into a single list
+    combined_scored_stocks = scored_stocks_longs + scored_stocks_shorts
+
+    # Sort the combined list by total score in descending order
+    combined_scored_stocks.sort(key=lambda x: x.total_score, reverse=True)
+
+    if not combined_scored_stocks:
         logger.warning("No stocks met the minimum scoring criteria")
-        return [], "No stocks met the screening criteria. Try adjusting the parameters."
+        return ScreenerResults(
+            candidates=[],
+            summary="No stocks met the screening criteria. Try adjusting the parameters."
+        )
     
     # Format results for the top N stocks
-    candidates, summary = format_results(scored_stocks, top_n=max_stocks)
+    candidates, summary = format_results(combined_scored_stocks, top_n=max_stocks)
     
     logger.info("Swing trade screening completed successfully")
-    return candidates, summary
+    return ScreenerResults(candidates=candidates[:max_stocks], summary=summary)
 
 if __name__ == "__main__":
     try:
         # Run the screener
-        candidates, summary = screen_for_swing_trades(max_stocks=5)
+        results = screen_for_swing_trades(max_stocks=5, is_backtest=True)
         
         # Display results
-        if candidates:
-            print(summary)
+        if results.summary:
+            print(results.summary)
         else:
             print("No suitable swing trading candidates found.")
     except Exception as e:

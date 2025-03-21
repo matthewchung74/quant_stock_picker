@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIModel
 from pydantic_ai.common_tools.duckduckgo import duckduckgo_search_tool
+from pydantic_ai.common_tools.tavily import tavily_search_tool
 
 # Import the logging utilities from the main application
 from logging_utils import get_component_logger
@@ -55,6 +56,9 @@ class SentimentAnalysisResult(BaseModel):
     news_summary: Optional[str] = None
     social_media_summary: Optional[str] = None
     analyst_ratings_summary: Optional[str] = None
+    short_interest_summary: Optional[str] = None  # Summary of short interest data
+    institutional_holdings_changes: Optional[str] = None  # Recent institutional position changes
+    options_sentiment: Optional[str] = None  # Put/Call ratio and options flow analysis
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 # Initialize the DeepSeek R1 model
@@ -69,14 +73,21 @@ sentiment_agent = Agent(
     model=ai_model,
     deps_type=SentimentAnalysisDependencies,
     result_type=SentimentAnalysisResult,
-    tools=[duckduckgo_search_tool()],
+    tools=[duckduckgo_search_tool(), tavily_search_tool(os.getenv('TAVILY_API_KEY'))],
     system_prompt=(
         "You are a sentiment analysis specialist focusing on stock market sentiment. "
         "You will use DuckDuckGo to search the web for the most relevant and recent news articles about the stock. "
-        "Your task is to analyze news, social media, and analyst opinions to gauge the "
-        "overall market sentiment for specific stocks. Provide a comprehensive analysis "
-        "that includes recent news impact, social media trends, and professional analyst "
-        "opinions. You must return a structured result with the following fields:\n"
+        "If the DuckDuckGo search fails or has no results, you will use Tavily search to find more information. "
+        "Your task is to analyze news, social media, analyst opinions, short interest, "
+        "institutional holdings, and options flow to gauge the overall market sentiment "
+        "for specific stocks. Pay special attention to bearish indicators that might "
+        "suggest short opportunities, including:\n"
+        "- High or increasing short interest\n"
+        "- Institutional selling pressure\n"
+        "- Bearish options flow (high put/call ratio)\n"
+        "- Negative news catalysts\n"
+        "- Technical breakdown patterns\n\n"
+        "You must return a structured result with the following fields:\n"
         "- ticker: The stock symbol being analyzed\n"
         "- sentiment_rating: One of 'BULLISH', 'NEUTRAL', or 'BEARISH'\n"
         "- confidence_level: One of 'HIGH', 'MEDIUM', or 'LOW'\n"
@@ -84,6 +95,9 @@ sentiment_agent = Agent(
         "- news_summary: Optional summary of news analysis\n"
         "- social_media_summary: Optional summary of social media sentiment\n"
         "- analyst_ratings_summary: Optional summary of analyst ratings\n"
+        "- short_interest_summary: Optional summary of short interest data\n"
+        "- institutional_holdings_changes: Optional summary of institutional position changes\n"
+        "- options_sentiment: Optional summary of options market sentiment\n"
         "\nEnsure your sentiment_rating and confidence_level exactly match one of the allowed values."
     )
 )
@@ -156,6 +170,18 @@ if __name__ == "__main__":
         if result.analyst_ratings_summary:
             print("\nANALYST RATINGS SUMMARY:")
             print(result.analyst_ratings_summary)
+            
+        if result.short_interest_summary:
+            print("\nSHORT INTEREST SUMMARY:")
+            print(result.short_interest_summary)
+            
+        if result.institutional_holdings_changes:
+            print("\nINSTITUTIONAL HOLDINGS CHANGES:")
+            print(result.institutional_holdings_changes)
+            
+        if result.options_sentiment:
+            print("\nOPTIONS SENTIMENT:")
+            print(result.options_sentiment)
             
         print("\n" + "-" * 50)
         print(f"Analysis completed in {elapsed_time:.2f} seconds")

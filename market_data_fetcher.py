@@ -38,8 +38,8 @@ except ImportError:
 load_dotenv()
 
 # Check for Alpaca API credentials
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY_UNITTEST")
+ALPACA_API_SECRET = os.getenv("ALPACA_API_SECRET_UNITTEST")
 
 if not ALPACA_API_KEY or not ALPACA_API_SECRET:
     logger.warning("Alpaca API credentials not found. Market data retrieval may fail.")
@@ -58,6 +58,9 @@ class PriceIndicator(BaseModel):
     sma_200: Optional[float] = None
     rsi: Optional[float] = None
     vwap: Optional[float] = None
+    trend_direction: Optional[str] = Field(None, description="Current trend direction: UPTREND, DOWNTREND, or SIDEWAYS")
+    short_borrow_rate: Optional[float] = Field(None, description="Current stock borrow rate for short selling")
+    short_float_ratio: Optional[float] = Field(None, description="Percentage of float that is sold short")
 
 class SupportResistanceLevels(BaseModel):
     """Model for support and resistance price levels."""
@@ -72,6 +75,9 @@ class MarketData(BaseModel):
     price_changes: Dict[str, float] = {}
     latest_indicators: Dict[str, PriceIndicator] = {}
     support_resistance: SupportResistanceLevels = SupportResistanceLevels()
+    is_shortable: bool = Field(True, description="Whether the stock can be shorted")
+    borrow_cost_tier: str = Field("N/A", description="Cost tier for borrowing the stock: LOW, MEDIUM, HIGH, or N/A")
+    shares_available: Optional[int] = Field(None, description="Number of shares available for shorting")
 
 
 def get_stock_data(ticker: str, lookback_days: int = 200) -> Optional[pd.DataFrame]:
@@ -304,7 +310,10 @@ def get_market_data(ticker: str) -> Dict:
                 'volume': None,
                 'price_changes': {},
                 'latest_indicators': {},
-                'support_resistance': {'support': [], 'resistance': []}
+                'support_resistance': {'support': [], 'resistance': []},
+                'is_shortable': True,
+                'borrow_cost_tier': "N/A",
+                'shares_available': None
             }
         
         # Calculate technical indicators
@@ -320,7 +329,10 @@ def get_market_data(ticker: str) -> Dict:
             'support_resistance': {
                 'support': analysis.get('support_levels', []),
                 'resistance': analysis.get('resistance_levels', [])
-            }
+            },
+            'is_shortable': True,
+            'borrow_cost_tier': "N/A",
+            'shares_available': None
         }
         
         logger.info(f"Successfully retrieved market data for {ticker}")
@@ -337,7 +349,10 @@ def get_market_data(ticker: str) -> Dict:
             'volume': None,
             'price_changes': {},
             'latest_indicators': {},
-            'support_resistance': {'support': [], 'resistance': []}
+            'support_resistance': {'support': [], 'resistance': []},
+            'is_shortable': True,
+            'borrow_cost_tier': "N/A",
+            'shares_available': None
         }
 
 def get_market_data_with_agent(ticker: str) -> MarketData:

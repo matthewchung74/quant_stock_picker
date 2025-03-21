@@ -11,6 +11,7 @@ import traceback
 from typing import Optional
 from datetime import datetime
 from dataclasses import dataclass
+from enum import Enum
 
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -26,8 +27,14 @@ from sentiment_analyzer import SentimentAnalysisResult
 # Load environment variables from .env file
 load_dotenv()
 
+class PositionType(str, Enum):
+    """Types of positions"""
+    LONG = "LONG"
+    SHORT = "SHORT"
+
 class TradingStrategy(BaseModel):
     """Model for strategy parameters for a specific timeframe."""
+    position_type: PositionType = Field(..., description="Type of position (LONG/SHORT)")
     expiration_date: str = Field(None, description="Expiration date for this timeframe")
     entry_price: float = Field(None, description="Entry price for this timeframe")
     stop_loss_price: float = Field(None, description="Stop loss price for this timeframe")
@@ -35,6 +42,9 @@ class TradingStrategy(BaseModel):
     risk_reward: str = Field(None, description="Risk/reward ratio (e.g. 1:2)")
     summary: str = Field(None, description="Summary of the strategy")
     explanation: str = Field(None, description="Explanation of the strategy")
+    borrow_cost: Optional[float] = Field(None, description="Borrow cost for short positions")
+    shares_available: Optional[int] = Field(None, description="Number of shares available to short")
+    short_squeeze_risk: Optional[str] = Field(None, description="Assessment of short squeeze risk")
 
 # Define dependencies for the Strategy Agent
 @dataclass
@@ -59,18 +69,21 @@ strategy_agent = Agent(
     system_prompt=(
         "As a trading strategy expert, your role is to develop actionable trading plans "
         "through comprehensive analysis. Your objective is to formulate detailed trading strategies "
-        "for stocks over various timeframes, including day trading, swing trading, and long-term investing. "
-        "For each timeframe, specify entry points, exit targets, stop-loss levels, and "
-        "position sizing recommendations. Ensure to incorporate technical analysis rationale and fundamental "
-        "considerations for each suggestion.\n\n"
-        "The structured result must include the following fields:\n"
-        "- The expiration date of the strategy\n"
-        "- The entry price of the strategy\n"
-        "- The stop loss price of the strategy\n"
-        "- The profit target of the strategy\n"
-        "- The risk/reward ratio of the strategy\n"
-        "- The summary of the strategy\n"
-        "- The comprehensive explanation of the strategy\n"
+        "for both long and short positions over various timeframes.\n\n"
+        "For long positions, focus on upside potential with controlled downside risk.\n"
+        "For short positions, consider:\n"
+        "- Borrowing costs and availability\n"
+        "- Short squeeze risk factors\n"
+        "- Technical breakdown patterns\n"
+        "- Fundamental deterioration\n\n"
+        "For each strategy, specify:\n"
+        "- Position type (LONG/SHORT)\n"
+        "- Entry points\n"
+        "- Exit targets\n"
+        "- Stop-loss levels\n"
+        "- Position sizing recommendations\n"
+        "- For shorts: borrow costs, availability, and squeeze risks\n\n"
+        "Incorporate both technical and fundamental analysis in your rationale.\n"
     )
 )
 
@@ -221,6 +234,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 50)
         print(f"TRADING STRATEGY FOR {ticker}")
         print("=" * 50)
+        print(f"Position Type: {strategy.position_type}")
         print(f"Expiration Date: {strategy.expiration_date}")
         print(f"Entry Price: {strategy.entry_price}")
         print(f"Stop Loss Price: {strategy.stop_loss_price}")
