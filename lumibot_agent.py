@@ -1,14 +1,34 @@
 from datetime import datetime, timedelta
 import traceback
-from lumibot.brokers import Alpaca
+# from lumibot.brokers import Alpaca  # Not needed anymore, using CustomAlpacaBroker
 from lumibot.strategies import Strategy
 from lumibot.traders import Trader
 import pandas as pd
 import os
 from logging_utils import get_component_logger, setup_logging
 from position_analyzer import PositionAction, PositionAnalysis, PositionType, get_position_analysis
-from trader import AlpacaTrader, RiskManagementConfig, generate_complete_analysis
+from trader import AlpacaTrader, RiskManagementConfig
+from analysis_generator import generate_llm_strategy_analysis
 from lumibot.backtesting import PolygonDataBacktesting
+import pytz
+from custom_alpaca_broker import CustomAlpacaBroker
+from typing import Dict
+import shutil
+
+# Helper function to check if we're in backtest mode
+def get_is_backtest():
+    return os.environ.get("BACKTEST", "false").lower() == "true"
+
+# Clean up previous backtest files if in backtest mode
+if get_is_backtest():
+    dirs_to_clean = ['./journal', './logs', './output']
+    for dir_path in dirs_to_clean:
+        try:
+            shutil.rmtree(dir_path, ignore_errors=True)
+            os.makedirs(dir_path, exist_ok=True)
+            print(f"Cleaned and recreated directory: {dir_path}")
+        except Exception as e:
+            print(f"Error cleaning directory {dir_path}: {e}")
 
 # Set up logging
 setup_logging()
@@ -22,33 +42,46 @@ class ThreePhaseStrategy(Strategy):
         self.logger = get_component_logger("Lumibot")
         self.is_backtest = get_is_backtest()
         
+        # In backtest mode, pass the current datetime to the trader
+        backtest_date = self.get_datetime() if self.is_backtest else None
+        
         self.trader = AlpacaTrader(
-            api_key=os.environ["ALPACA_API_KEY_AGENT"],
-            api_secret=os.environ["ALPACA_API_SECRET_AGENT"],
-            is_paper=os.environ.get("ALPACA_PAPER_TRADING", "true").lower() == "true",
-            is_backtest=self.is_backtest
+            api_key=os.environ["ALPACA_API_KEY_LLM_AGENT"],
+            api_secret=os.environ["ALPACA_API_SECRET_LLM_AGENT"],
+            is_paper=os.environ.get("ALPACA_PAPER_TRADING_LLM_AGENT", "true").lower() == "true",
+            is_backtest=self.is_backtest,
+            backtest_date=backtest_date
         )
         
 
     def before_starting_trading(self):
-        self.logger.info(f"Executing before starting trading at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
+        self.logger.info(f"Executing before starting trading at {self.get_current_datetime().strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
 
+        self.morning_run_complete = False
         self.midday_run_complete = False
         self.end_day_run_complete = False
-
-        self.execute_morning_strategy()
 
 
     def on_trading_iteration(self):
         current_time = self.get_datetime()
+        
+        # Update backtest date if in backtest mode
+        if self.is_backtest:
+            self.trader.backtest_date = current_time
+            self.trader.journal.backtest_date = current_time
+        
+        if current_time.hour == 9 and not self.morning_run_complete:
+            self.logger.info(f"Executing morning strategy at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
+            self.morning_run_complete = True
+            self.execute_morning_strategy()
 
         if current_time.hour == 12 and not self.midday_run_complete:
-            self.logger.info(f"Executing mid-day position management at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
+            self.logger.info(f"Executing mid-day position management at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
             self.midday_run_complete = True
             self.execute_midday_strategy()            
 
         if current_time.hour == 4 and not self.end_day_run_complete:
-            self.logger.info(f"Executing end of day cleanup at {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
+            self.logger.info(f"Executing end of day cleanup at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} EST...")
             self.end_day_run_complete = True
             self.execute_end_day_strategy()
 
@@ -74,14 +107,14 @@ class ThreePhaseStrategy(Strategy):
         for position in existing_positions:
             try:
                 # Get complete analysis for the position
-                strategy, market_data, _, _ = generate_complete_analysis(position.symbol)
+                strategy, market_data, _, _ = generate_llm_strategy_analysis(position.symbol)
                 
                 # Create position analysis
                 position_analysis = PositionAnalysis(
                     ticker=position.symbol,
                     current_price=float(position.current_price),
                     purchase_price=float(position.avg_entry_price),
-                    purchase_date=datetime.now(),  # Use current date since we don't have purchase date
+                    purchase_date=self.get_current_datetime(),  # Use current date since we don't have purchase date
                     days_held=0,  # We don't have the actual purchase date, so start with 0
                     recommendation=PositionAction.HOLD,  # Default to HOLD, will be updated based on analysis
                     stop_loss=strategy.stop_loss_price,
@@ -203,29 +236,31 @@ class ThreePhaseStrategy(Strategy):
         except Exception as e:
             self.logger.error(f"Error in midday strategy execution: {e}")
 
-
-def get_is_backtest():
-    return os.environ.get("BACKTEST", "false").lower() == "true"
+    def get_current_datetime(self):
+        """Get the current datetime, respecting backtest mode"""
+        if self.is_backtest and self.trader.backtest_date:
+            return self.trader.backtest_date
+        return datetime.now()
 
 
 if __name__ == "__main__":
     # Configure broker
     ALPACA_CONFIG = {
-        "API_KEY": os.getenv("ALPACA_API_KEY_AGENT"),
-        "API_SECRET": os.getenv("ALPACA_API_SECRET_AGENT"),
-        "PAPER": True if os.getenv("ALPACA_PAPER_TRADING", "true").lower() == "true" else False,
+        "API_KEY": os.getenv("ALPACA_API_KEY_LLM_AGENT"),
+        "API_SECRET": os.getenv("ALPACA_API_SECRET_LLM_AGENT"),
+        "PAPER": True if os.getenv("ALPACA_PAPER_TRADING_LLM_AGENT", "true").lower() == "true" else False,
         "URL": os.getenv("ALPACA_BASE_URL")
     }
 
-    # Create the broker instance
-    broker = Alpaca(ALPACA_CONFIG)
+    # Create the broker instance - use our custom broker that handles bracket orders better
+    broker = CustomAlpacaBroker(ALPACA_CONFIG)
     
-    backtest = os.environ.get("BACKTEST", "false").lower() == "true"
+    backtest = get_is_backtest()
     strategy = ThreePhaseStrategy(broker=broker)
 
     if backtest:
-        start = datetime(2025, 3, 10)
-        end = datetime(2025, 3, 12)
+        start = datetime(2023, 3, 1)  # Using 2023 instead of 2025
+        end = datetime(2023, 3, 31)   # Using a full month of historical data
         strategy.run_backtest(
             PolygonDataBacktesting,
             start,

@@ -20,13 +20,12 @@ from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopL
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderStatus, QueryOrderStatus, OrderClass
 
 from logging_utils import get_component_logger, setup_logging
-from strategy_analyzer import TradingStrategy, get_strategy_with_agent
+from strategy_analyzer import TradingStrategy
 from position_analyzer import PositionAnalysis, PositionAction, PositionType
 from screener import screen_for_swing_trades
-from sentiment_analyzer import SentimentAnalysisResult, get_sentiment_analysis_with_agent
-from macro_analyzer import get_macro_analysis_with_agent
-from market_data_fetcher import MarketData, get_market_data_with_agent
+from analysis_generator import generate_llm_strategy_analysis
 from csv_writer import generate_recommendations_csv
+from trading_journal import TradingJournal, TradeRecord, TradeStatus
 
 @dataclass
 class RiskManagementConfig:
@@ -45,14 +44,22 @@ class TradeExpiration:
     expiration_date: datetime
     strategy: TradingStrategy
     position_type: PositionType
+    trade_id: Optional[str] = None
 
 class AlpacaTrader:
-    def __init__(self, api_key: str, api_secret: str, is_paper: bool = True, is_backtest: bool = False):
+    def __init__(self, api_key: str, api_secret: str, is_paper: bool = True, is_backtest: bool = False, backtest_date=None):
         self.logger = get_component_logger("Trader")
         self.trading_client = TradingClient(api_key, api_secret, paper=is_paper)
         self.risk_config = RiskManagementConfig()
         self.trade_expirations: Dict[str, TradeExpiration] = {}
         self.is_backtest = is_backtest
+        self.backtest_date = backtest_date
+        
+        # Initialize journal with backtest info if needed
+        self.journal = TradingJournal(
+            backtest_mode=is_backtest,
+            backtest_date=backtest_date
+        )
 
     def get_account_state(self) -> Dict:
         """Get current account state including positions"""
@@ -139,6 +146,21 @@ class AlpacaTrader:
             for order in open_orders:
                 self.logger.info(f"Canceling existing order {order.id} for {symbol}")
                 self.trading_client.cancel_order_by_id(order.id)
+                
+                # Find the trade ID if available
+                trade_id = None
+                for exp in self.trade_expirations.values():
+                    if exp.ticker == symbol and exp.entry_order_id == order.id:
+                        trade_id = exp.trade_id
+                        break
+                
+                # Record cancellation in journal if we have the trade ID
+                if trade_id:
+                    self.journal.cancel_trade(
+                        trade_id=trade_id,
+                        reason="Order cancelled before execution"
+                    )
+                
         except Exception as e:
             self.logger.error(f"Error canceling orders for {symbol}: {e}")
             raise
@@ -188,34 +210,64 @@ class AlpacaTrader:
                     limit_price=strategy.profit_target
                 ),
                 stop_loss=dict(
-                    stop_price=strategy.stop_loss_price
+                    stop_price=strategy.stop_loss_price,
+                    limit_price=strategy.stop_loss_price * 0.99 if strategy.position_type == PositionType.LONG else strategy.stop_loss_price * 1.01  # Add a 1% buffer for the limit price
                 )
             )
             
             # Place the order and capture the response
             order_response = self.trading_client.submit_order(order_data)
-            order_id = order_response.id  # Extract the order ID from the response
-            self.logger.info(f"Order placed for {ticker} with ID {order_id}")
-            
-            # Track the order using the order ID
+            order_id = order_response.id
+
+            # Record the trade in the journal
+            trade_id = self.journal.record_new_trade(
+                ticker=ticker,
+                strategy=strategy,
+                order_id=order_id,
+                shares=shares
+            )
+
+            # Store the trade_id for future reference
             self.trade_expirations[ticker] = TradeExpiration(
                 ticker=ticker,
-                entry_order_id=order_id,
+                entry_order_id=order_id, 
                 expiration_date=datetime.now().replace(hour=16, minute=0, second=0),
                 strategy=strategy,
-                position_type=strategy.position_type
+                position_type=strategy.position_type,
+                trade_id=trade_id
             )
             
             position_type_str = "LONG" if strategy.position_type == PositionType.LONG else "SHORT"
-            self.logger.info(f"Placed day bracket order for {ticker} ({position_type_str}):")
-            self.logger.info(f"Entry: {shares} shares at ${strategy.entry_price}")
-            self.logger.info(f"Stop Loss: ${strategy.stop_loss_price}")
-            self.logger.info(f"Take Profit: ${strategy.profit_target}")
+            
+            # Enhanced logging for bracket orders
+            self.logger.info("=" * 50)
+            self.logger.info(f"BRACKET ORDER PLACED: {ticker} ({position_type_str}) - ORDER ID: {order_id}")
+            self.logger.info("-" * 50)
+            self.logger.info(f"Entry:      {shares} shares at ${strategy.entry_price:.2f}")
+            
+            # Calculate risk and reward in dollars
+            if strategy.position_type == PositionType.LONG:
+                risk_per_share = strategy.entry_price - strategy.stop_loss_price
+                reward_per_share = strategy.profit_target - strategy.entry_price
+            else:  # SHORT
+                risk_per_share = strategy.stop_loss_price - strategy.entry_price
+                reward_per_share = strategy.entry_price - strategy.profit_target
+                
+            total_risk = risk_per_share * shares
+            total_reward = reward_per_share * shares
+            
+            self.logger.info(f"Stop Loss:  ${strategy.stop_loss_price:.2f} (Risk: ${risk_per_share:.2f}/share, Total: ${total_risk:.2f})")
+            self.logger.info(f"Take Profit: ${strategy.profit_target:.2f} (Reward: ${reward_per_share:.2f}/share, Total: ${total_reward:.2f})")
+            self.logger.info(f"Risk/Reward: {strategy.risk_reward}")
+            self.logger.info(f"Expiration: {datetime.now().replace(hour=16, minute=0, second=0).strftime('%Y-%m-%d %H:%M:%S')}")
+            
             if strategy.position_type == PositionType.SHORT:
                 self.logger.info(f"Borrow Cost: {strategy.borrow_cost}%")
                 self.logger.info(f"Shares Available: {strategy.shares_available}")
                 self.logger.info(f"Short Squeeze Risk: {strategy.short_squeeze_risk}")
-            self.logger.info(f"Order expires at market close today")
+            
+            self.logger.info("=" * 50)
+            
             return True
             
         except Exception as e:
@@ -257,7 +309,29 @@ class AlpacaTrader:
                     # For now, we're only handling EXIT recommendations
                     if analysis.recommendation == PositionAction.EXIT:
                         self.logger.info(f"Closing position in {ticker} based on analysis")
-                        self.trading_client.close_position(ticker)
+                        
+                        # Get the position details before closing
+                        position = self.trading_client.get_position(ticker)
+                        close_price = float(position.current_price)
+                        
+                        # Close the position
+                        close_response = self.trading_client.close_position(ticker)
+                        
+                        # Find the trade ID if available
+                        trade_id = None
+                        for exp in self.trade_expirations.values():
+                            if exp.ticker == ticker:
+                                trade_id = exp.trade_id
+                                break
+                        
+                        # Record in the journal if we have the trade ID
+                        if trade_id:
+                            self.journal.close_trade(
+                                trade_id=trade_id,
+                                exit_price=close_price,
+                                exit_order_id=getattr(close_response, 'id', 'market_close'),
+                                exit_reason=f"Position exited based on analysis: {analysis.recommendation}"
+                            )
                         
         except Exception as e:
             self.logger.error(f"Error managing positions: {e}")
@@ -289,7 +363,7 @@ class AlpacaTrader:
             try:
                 logger.info(f"\n----- Starting Complete Analysis for {ticker} -----\n")
                 start_time = time.time()
-                analysis, market_data, sentiment_analysis, macro_analysis = generate_complete_analysis(ticker)
+                analysis, market_data, sentiment_analysis, macro_analysis = generate_llm_strategy_analysis(ticker)
                 all_analyses[ticker] = analysis
                 all_market_data[ticker] = market_data
                 all_sentiment_analysis[ticker] = sentiment_analysis
@@ -323,152 +397,23 @@ class AlpacaTrader:
         # This is a placeholder implementation
         return shares * 10.0  # Example calculation
 
-def generate_complete_analysis(ticker: str) -> Tuple[TradingStrategy, MarketData, SentimentAnalysisResult, Any]:
-    """Generate a complete analysis for a stock"""
-    logger = get_component_logger("CompleteAnalysis")
-    logger.info(f"Generating complete analysis for {ticker}")
-    
-    start_time = time.time()
-
-    try:
-        # 1. Get market data
-        market_data = get_market_data_with_agent(ticker)
-        logger.info(f"Current price for {ticker}: ${market_data.latest_price:.2f}" if market_data.latest_price else "Price data not available")
-            
-        # 2. Get sentiment analysis
-        sentiment_analysis = get_sentiment_analysis_with_agent(ticker)
-        logger.info(f"Completed sentiment analysis for {ticker}")
+    def show_performance(self) -> None:
+        """Display trading performance metrics"""
+        performance = self.journal.calculate_performance()
         
-        # 3. Get macro analysis
-        macro_analysis = get_macro_analysis_with_agent(ticker)
-        logger.info(f"Completed macro analysis for {ticker}")
-
-        # 4. Get trading strategy
-        strategy = get_strategy_with_agent(
-            ticker=ticker,
-            market_data=market_data,
-            sentiment_analysis=sentiment_analysis,
-            macro_analysis=macro_analysis
-        )
-        logger.info(f"Completed trading strategy for {ticker}")
-
-        elapsed_time = time.time() - start_time
-        logger.info(f"Complete analysis for {ticker} completed in {elapsed_time:.2f} seconds")
-
-        return strategy, market_data, sentiment_analysis, macro_analysis
-        
-    except Exception as e:
-        logger.error(f"Error generating complete analysis for {ticker}: {e}")
-        logger.error(traceback.format_exc())
-        raise
-
-def run_trader(ticker: str = None):
-    """Main trading function"""
-    logger = get_component_logger("Trader")
-    
-    trader = None
-    try:
-        trader = AlpacaTrader(
-            api_key=os.environ["ALPACA_API_KEY_UNITTEST"],
-            api_secret=os.environ["ALPACA_API_SECRET_UNITTEST"],
-            is_paper=True,
-            is_backtest=True
-        )
-
-        # Get account state
-        account_state = trader.get_account_state()
-
-        # First, analyze and manage any existing positions
-        existing_positions = account_state["positions"]
-        if existing_positions:
-            logger.info("\n======== Analyzing Existing Positions ========")
-            position_analyses = {}
-            
-            for position in existing_positions:
-                try:
-                    # Get complete analysis for the position
-                    strategy, market_data, _, _ = generate_complete_analysis(position.symbol)
-                    
-                    # Create position analysis
-                    position_analysis = PositionAnalysis(
-                        ticker=position.symbol,
-                        current_price=float(position.current_price),
-                        purchase_price=float(position.avg_entry_price),
-                        purchase_date=datetime.now(),  # Use current date since we don't have purchase date
-                        days_held=0,  # We don't have the actual purchase date, so start with 0
-                        recommendation=PositionAction.HOLD,  # Default to HOLD, will be updated based on analysis
-                        stop_loss=strategy.stop_loss_price,
-                        target_price=strategy.profit_target,
-                        summary=strategy.summary,
-                        explanation=strategy.explanation
-                    )
-                    
-                    # Determine recommendation based on analysis
-                    if float(position.current_price) <= strategy.stop_loss_price:
-                        position_analysis.recommendation = PositionAction.EXIT
-                    elif float(position.current_price) >= strategy.profit_target:
-                        position_analysis.recommendation = PositionAction.EXIT
-                    
-                    position_analyses[position.symbol] = position_analysis
-                    
-                    logger.info(f"\nPosition Analysis for {position.symbol}:")
-                    logger.info(f"Days Held: {position_analysis.days_held}")
-                    logger.info(f"Entry Price: ${float(position.avg_entry_price):.2f}")
-                    logger.info(f"Current Price: ${float(position.current_price):.2f}")
-                    logger.info(f"P/L: ${float(position.unrealized_pl):.2f} ({float(position.unrealized_plpc) * 100:.1f}%)")
-                    logger.info(f"Recommendation: {position_analysis.recommendation}")
-                    logger.info(f"New Stop Loss: ${position_analysis.stop_loss:.2f}")
-                    logger.info(f"New Target: ${position_analysis.target_price:.2f}")
-                    
-                except Exception as e:
-                    logger.error(f"Error analyzing position for {position.symbol}: {e}")
-                    continue
-            
-            # Manage positions based on analysis
-            if position_analyses:
-                trader.manage_existing_positions(position_analyses)
-
-            # Get fresh account state after managing positions
-            account_state = trader.get_account_state()
-
-        # Now check account criteria for new trades
-        if float(account_state["equity"]) < trader.risk_config.min_account_balance:
-            logger.info(f"Account balance (${float(account_state['equity']):.2f}) below minimum requirement (${trader.risk_config.min_account_balance})")
-            return
-            
-        if float(account_state["buying_power"]) < trader.risk_config.min_available_cash:
-            logger.info(f"Available cash (${float(account_state['buying_power']):.2f}) below minimum requirement (${trader.risk_config.min_available_cash})")
-            return
-            
-        # Check position limits
-        if len(account_state["positions"]) >= trader.risk_config.max_concurrent_positions:
-            logger.info(f"Maximum number of positions ({trader.risk_config.max_concurrent_positions}) reached")
-            return
-        
-        # Then proceed with new trade analysis
-        if ticker:
-            # Analyze specific ticker
-            logger.info(f"Analyzing specific ticker: {ticker}")
-            strategy, market_data, _, _ = generate_complete_analysis(ticker)
-            analyses = {ticker: strategy}
-        else:
-            # Run full analysis
-            analyses = trader.run_analysis()
-        
-        # Place new trades for qualifying strategies
-        for ticker, strategy in analyses.items():
-            if trader.can_place_new_trade(strategy, ticker):
-                trader.place_new_trade(strategy, ticker)
-                
-    except Exception as e:
-        logger.error(f"Error in trader execution: {e}")
-        logger.error(traceback.format_exc())
+        self.logger.info("\n=== Trading Performance ===")
+        self.logger.info(f"Total Trades: {performance['total_trades']}")
+        self.logger.info(f"Winning Trades: {performance['winning_trades']}")
+        self.logger.info(f"Win Rate: {performance['win_rate']:.1f}%")
+        self.logger.info(f"Total P/L: ${performance['profit_loss']:.2f}")
+        self.logger.info(f"Avg P/L per Trade: ${performance['avg_profit_per_trade']:.2f}")
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Stock analysis and trading tool")
-    parser.add_argument("--ticker", type=str, help="Specific ticker to analyze")
+    parser.add_argument("--demo", action="store_true", default=True, help="Run a demo of trading capabilities")
+    parser.add_argument("--ticker", type=str, help="Specific ticker to analyze or trade")
     parser.add_argument("--log-level", type=str, default="INFO", 
                        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                        help="Set the logging level")
@@ -481,5 +426,186 @@ if __name__ == "__main__":
         console_level=log_level
     )
     
-    # Run trader
-    run_trader(args.ticker) 
+    logger = get_component_logger("TradingDemo")
+    
+    if args.demo:
+        logger.info("====== Running Trader Demo ======")
+        # Create trader instance
+        try:
+            trader = AlpacaTrader(
+                api_key=os.environ["ALPACA_API_KEY_UNITTEST"],
+                api_secret=os.environ["ALPACA_API_SECRET_UNITTEST"],
+                is_paper=True,
+                is_backtest=False
+            )
+            
+            # 1. Demo: Get account state
+            logger.info("\n=== Account State ===")
+            account_state = trader.get_account_state()
+            logger.info(f"Account Equity: ${float(account_state['equity']):.2f}")
+            logger.info(f"Buying Power: ${float(account_state['buying_power']):.2f}")
+            logger.info(f"Current Positions: {len(account_state['positions'])}")
+            logger.info(f"Current Orders: {len(account_state['orders'])}")
+            
+            # 2. Demo: Place a bracket order (LONG)
+            logger.info("\n=== Placing a Demo LONG Bracket Order ===")
+            # Create a demo strategy for a LONG position
+            ticker = args.ticker or "AAPL"  # Default to AAPL if no ticker provided
+            
+            # Get current market price
+            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.requests import StockLatestQuoteRequest
+            
+            # Get current price from Alpaca
+            data_client = StockHistoricalDataClient(
+                api_key=os.environ["ALPACA_API_KEY_UNITTEST"],
+                secret_key=os.environ["ALPACA_API_SECRET_UNITTEST"]
+            )
+            latest_quote_request = StockLatestQuoteRequest(symbol_or_symbols=ticker)
+            try:
+                latest_quote = data_client.get_stock_latest_quote(latest_quote_request)
+                current_price = float(latest_quote[ticker].ask_price)
+                logger.info(f"Current price for {ticker}: ${current_price:.2f}")
+            except Exception as e:
+                logger.warning(f"Could not get latest quote: {e}")
+                current_price = 150.0  # Fallback for demo
+                logger.info(f"Using demo price for {ticker}: ${current_price:.2f}")
+                
+            # Create demo strategy
+            from strategy_analyzer import TradingStrategy, PositionType
+            demo_strategy = TradingStrategy(
+                position_type=PositionType.LONG,
+                expiration_date=datetime.now().strftime("%Y-%m-%d 16:00:00"),
+                entry_price=current_price * 0.99,  # Slightly below current price
+                stop_loss_price=current_price * 0.95,  # 5% below current price
+                profit_target=current_price * 1.05,  # 5% above current price
+                risk_reward="1:1",
+                summary="Demo LONG trade for bracket order testing",
+                explanation="This is a test trade to demonstrate bracket orders"
+            )
+            
+            # Place the trade
+            trade_result = trader.place_new_trade(demo_strategy, ticker)
+            logger.info(f"Trade placement result: {'Success' if trade_result else 'Failed'}")
+            
+            # 3. Demo: Show open orders
+            logger.info("\n=== Current Open Orders ===")
+            filter_request = GetOrdersRequest(
+                status=QueryOrderStatus.OPEN
+            )
+            open_orders = trader.trading_client.get_orders(filter=filter_request)
+            for order in open_orders:
+                logger.info(f"Order ID: {order.id}")
+                logger.info(f"Symbol: {order.symbol}")
+                logger.info(f"Side: {order.side}")
+                logger.info(f"Type: {order.type}")
+                logger.info(f"Qty: {order.qty}")
+                logger.info(f"Status: {order.status}")
+                logger.info(f"Class: {order.order_class}")
+                logger.info(f"Time in Force: {order.time_in_force}")
+                logger.info("---")
+            
+            if not open_orders:
+                logger.info("No open orders found.")
+            
+            # 3b. Demo: Check existing positions and close one if it exists
+            logger.info("\n=== Current Positions ===")
+            positions = trader.trading_client.get_all_positions()
+            for position in positions:
+                logger.info(f"Position: {position.symbol}")
+                logger.info(f"Quantity: {position.qty} shares")
+                logger.info(f"Side: {'LONG' if float(position.qty) > 0 else 'SHORT'}")
+                logger.info(f"Average Entry: ${float(position.avg_entry_price):.2f}")
+                logger.info(f"Current Price: ${float(position.current_price):.2f}")
+                logger.info(f"P/L: ${float(position.unrealized_pl):.2f} ({float(position.unrealized_plpc) * 100:.2f}%)")
+                logger.info("---")
+            
+            if not positions:
+                logger.info("No positions found.")
+            else:
+                # Demo closing a position with market order
+                logger.info("\n=== Closing a Position (Market Order) ===")
+                position_to_close = positions[0]  # Take the first position
+                ticker_to_close = position_to_close.symbol
+                
+                # Create a simple position analysis for exit
+                position_analysis = PositionAnalysis(
+                    ticker=ticker_to_close,
+                    current_price=float(position_to_close.current_price),
+                    purchase_price=float(position_to_close.avg_entry_price),
+                    purchase_date=datetime.now(),
+                    days_held=0,
+                    recommendation=PositionAction.EXIT,
+                    stop_loss=float(position_to_close.avg_entry_price) * 0.9,  # Demo values
+                    target_price=float(position_to_close.avg_entry_price) * 1.1,  # Demo values
+                    summary="Demo position being closed",
+                    explanation="This is a test of the market order for closing positions",
+                    position_type=PositionType.LONG if float(position_to_close.qty) > 0 else PositionType.SHORT
+                )
+                
+                logger.info(f"Closing position in {ticker_to_close} with market order")
+                try:
+                    # Close the position
+                    trader.trading_client.close_position(ticker_to_close)
+                    logger.info(f"Successfully closed position in {ticker_to_close}")
+                except Exception as e:
+                    logger.error(f"Error closing position: {e}")
+            
+            # 4. Demo: Cancel orders (if any)
+            if open_orders:
+                logger.info("\n=== Cancelling Orders ===")
+                for order in open_orders:
+                    logger.info(f"Cancelling order {order.id} for {order.symbol}")
+                    try:
+                        trader.trading_client.cancel_order_by_id(order.id)
+                        logger.info("Order cancelled successfully")
+                    except Exception as e:
+                        logger.error(f"Error cancelling order: {e}")
+            
+            # 5. Demo: Place a SHORT bracket order (if requested)
+            if args.ticker:  # Only do this if user specified a ticker
+                logger.info("\n=== Placing a Demo SHORT Bracket Order ===")
+                # Create a demo strategy for a SHORT position
+                short_strategy = TradingStrategy(
+                    position_type=PositionType.SHORT,
+                    expiration_date=datetime.now().strftime("%Y-%m-%d 16:00:00"),
+                    entry_price=current_price * 1.01,  # Slightly above current price
+                    stop_loss_price=current_price * 1.05,  # 5% above current price
+                    profit_target=current_price * 0.95,  # 5% below current price
+                    risk_reward="1:1",
+                    summary="Demo SHORT trade for bracket order testing",
+                    explanation="This is a test trade to demonstrate SHORT bracket orders",
+                    borrow_cost=1.5,  # Demo borrow cost
+                    shares_available=1000  # Demo shares available
+                )
+                
+                # Place the trade
+                short_result = trader.place_new_trade(short_strategy, ticker)
+                logger.info(f"SHORT trade placement result: {'Success' if short_result else 'Failed'}")
+            
+            # 6. Demo cleanup at the end
+            logger.info("\n=== Cleaning Up Demo ===")
+            trader.cleanup_expired_orders()
+            logger.info("Demo complete!")
+            
+            # Include in demo or after running trades
+            logger.info("\n=== Trading Journal Performance ===")
+            trader.show_performance()
+            
+        except Exception as e:
+            logger.error(f"Error in trader demo: {e}")
+            logger.error(traceback.format_exc())
+    else:
+        # Just show help if no specific parameters
+        print("\nTrader Module - Trading Capabilities Demo")
+        print("=========================================")
+        print("Run the demo with: python trader.py --demo")
+        print("  Add a specific ticker: python trader.py --demo --ticker MSFT")
+        print("  For more options: python trader.py --help")
+        print("\nThe demo will show:")
+        print("1. Current account state")
+        print("2. Placing a LONG bracket order")
+        print("3. Viewing open orders")
+        print("4. Closing positions with market orders")
+        print("5. Cancelling open orders")
+        print("6. Placing a SHORT bracket order (if ticker provided)") 

@@ -76,8 +76,7 @@ sentiment_agent = Agent(
     tools=[duckduckgo_search_tool(), tavily_search_tool(os.getenv('TAVILY_API_KEY'))],
     system_prompt=(
         "You are a sentiment analysis specialist focusing on stock market sentiment. "
-        "You will use DuckDuckGo to search the web for the most relevant and recent news articles about the stock. "
-        "If the DuckDuckGo search fails or has no results, you will use Tavily search to find more information. "
+        "You will use Tavily to search the web for the most relevant and recent news articles about the stock. "
         "Your task is to analyze news, social media, analyst opinions, short interest, "
         "institutional holdings, and options flow to gauge the overall market sentiment "
         "for specific stocks. Pay special attention to bearish indicators that might "

@@ -82,7 +82,6 @@ macro_agent = Agent(
         "You are a macroeconomic analysis expert specializing in how broader economic factors "
         "impact specific stocks and sectors. "
         "You will use Tavily search to find the most relevant and recent macroeconomic information. "
-        "If the Tavily search fails or has an error, you will use DuckDuckGo search to find more information. "
         "Your task is to provide detailed analysis on how "
         "macroeconomic indicators, interest rates, inflation, geopolitical events, and industry "
         "trends might affect a specific stock. Pay special attention to factors that could "

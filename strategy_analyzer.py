@@ -153,13 +153,16 @@ def get_strategy_with_agent(
         MACRO ANALYSIS:
         {macro_text}
         
-        Provide:
+        IMPORTANT: Your strategy MUST include precise numerical values for:
         1. Entry price
-        2. Stop loss price
-        3. Profit target
+        2. Stop loss price (must be lower than entry for LONG, higher for SHORT)
+        3. Profit target (must be higher than entry for LONG, lower for SHORT)
         4. Risk/reward ratio
-        5. Brief summary (1-2 sentences)
-        6. Detailed explanation of the strategy
+        5. Expiration date for the order (format: YYYY-MM-DD HH:MM:SS)
+        
+        Also provide:
+        6. Brief summary (1-2 sentences)
+        7. Detailed explanation of the strategy
         """
         
         # Run the agent to get the strategy
@@ -169,11 +172,17 @@ def get_strategy_with_agent(
             model_settings={"temperature": 0.1}
         )
         
+        strategy = result.data
+        
+        # Ensure that stop_loss_price, profit_target, and expiration_date are defined
+        if not strategy.stop_loss_price or not strategy.profit_target or not strategy.expiration_date:
+            raise ValueError(f"Strategy for {ticker} is missing required fields: stop_loss_price, profit_target, or expiration_date.")
+        
         # Log completion
         elapsed_time = time.time() - start_time
         logger.info(f"Strategy generation for {ticker} completed in {elapsed_time:.2f} seconds")
         
-        return result.data
+        return strategy
     
     except Exception as e:
         logger.error(f"Error getting trading strategy: {e}")
